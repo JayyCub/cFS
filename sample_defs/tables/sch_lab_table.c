@@ -64,6 +64,7 @@ SCH_LAB_ScheduleTable_t SCH_TBL_Structure =
         {CFE_SB_MSGID_WRAP_VALUE(CI_LAB_SEND_HK_MID),     50, 0}, /* every 5.0 seconds */
         {CFE_SB_MSGID_WRAP_VALUE(TO_LAB_SEND_HK_MID),     52, 0}, /* every 5.2 seconds */
         {CFE_SB_MSGID_WRAP_VALUE(SAMPLE_APP_SEND_HK_MID), 54, 0}, /* every 5.4 seconds */
+        {CFE_SB_MSGID_WRAP_VALUE(0x1894),                 10, 0}, /* GNC_APP wakeup 1 Hz */
         {CFE_SB_MSGID_WRAP_VALUE(CF_SEND_HK_MID),         56, 0}, /* every 5.6 seconds */
         {CFE_SB_MSGID_WRAP_VALUE(CF_WAKE_UP_MID),         1,  0}, /* every 0.1 seconds (example of 10 Hz packet) */
         {CFE_SB_MSGID_WRAP_VALUE(MD_SEND_HK_MID),         58, 0}, /* every 5.8 seconds */

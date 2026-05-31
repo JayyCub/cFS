@@ -172,50 +172,54 @@ CFE_TBL_FileDef_t CFE_TBL_FileDef = { "LC_ADT",
                                       (sizeof(LC_ADTEntry_t) * LC_MAX_ACTIONPOINTS) };
 
 /*
-** Alternate actionpoint definition table (ADT) data
+** GNC safety actionpoint definition table (ADT) data — Phase 5D
+**
+** AP #0: Overspeed     — WP_0 (ClosingSpeed > 0.35 m/s) for 2 cycles → RTS 1 (ABORT)
+** AP #1: Off-corridor  — WP_1 (LateralOffset > 2.0 m) AND WP_2 (Phase==APPROACH) → RTS 2 (ABORT)
+** AP #2: Telemetry loss — WP_3 (TlmStaleSec >= 5) for 1 cycle → RTS 1 (ABORT)
 */
 LC_ADTEntry_t LC_ADT[LC_MAX_ACTIONPOINTS] = {
-    /* #0 */
-    {.DefaultState      = LC_APSTATE_DISABLED,
-     .MaxPassiveEvents  = 3,
-     .MaxPassFailEvents = 3,
-     .MaxFailPassEvents = 3,
-     .RTSId             = 0,
+    /* #0 GNC: overspeed abort — fires RTS 1 after 2 consecutive overspeed cycles */
+    {.DefaultState      = LC_APSTATE_ACTIVE,
+     .MaxPassiveEvents  = 2,
+     .MaxPassFailEvents = 2,
+     .MaxFailPassEvents = 2,
+     .RTSId             = 1,
+     .MaxFailsBeforeRTS = 2,
+     .EventType         = CFE_EVS_EventType_CRITICAL,
+     .EventID           = LC_BASE_AP_EID + 0,
+     .EventText         = {"GNC overspeed >0.35m/s"},
+     .RPNEquation =
+         {/* (WP_0) */
+          0, LC_RPN_EQUAL}},
+
+    /* #1 GNC: off-corridor abort — LateralOffset > 2.0 m while in APPROACH phase */
+    {.DefaultState      = LC_APSTATE_ACTIVE,
+     .MaxPassiveEvents  = 2,
+     .MaxPassFailEvents = 2,
+     .MaxFailPassEvents = 2,
+     .RTSId             = 2,
      .MaxFailsBeforeRTS = 3,
-     .EventType         = CFE_EVS_EventType_INFORMATION,
-     .EventID           = 0,
-     .EventText         = {"Placeholder"},
+     .EventType         = CFE_EVS_EventType_CRITICAL,
+     .EventID           = LC_BASE_AP_EID + 1,
+     .EventText         = {"GNC off-corridor >2m APPROACH"},
      .RPNEquation =
-         {/* (WP_0) */
-          0, LC_RPN_EQUAL}},
+         {/* (WP_1 AND WP_2) */
+          1, 2, LC_RPN_AND, LC_RPN_EQUAL}},
 
-    /* #1 (unused) */
-    {.DefaultState      = LC_APSTATE_NOT_USED,
-     .MaxPassiveEvents  = 0,
-     .MaxPassFailEvents = 0,
-     .MaxFailPassEvents = 0,
-     .RTSId             = 0,
-     .MaxFailsBeforeRTS = 0,
-     .EventType         = CFE_EVS_EventType_INFORMATION,
-     .EventID           = 0,
-     .EventText         = {" "},
+    /* #2 GNC: telemetry loss abort — no Unity UDP for >= 5 seconds */
+    {.DefaultState      = LC_APSTATE_ACTIVE,
+     .MaxPassiveEvents  = 2,
+     .MaxPassFailEvents = 2,
+     .MaxFailPassEvents = 2,
+     .RTSId             = 1,
+     .MaxFailsBeforeRTS = 1,
+     .EventType         = CFE_EVS_EventType_CRITICAL,
+     .EventID           = LC_BASE_AP_EID + 2,
+     .EventText         = {"GNC tlm loss >=5s"},
      .RPNEquation =
-         {/* (WP_0) */
-          0, LC_RPN_EQUAL}},
-
-    /* #2 (unused) */
-    {.DefaultState      = LC_APSTATE_NOT_USED,
-     .MaxPassiveEvents  = 0,
-     .MaxPassFailEvents = 0,
-     .MaxFailPassEvents = 0,
-     .RTSId             = 0,
-     .MaxFailsBeforeRTS = 0,
-     .EventType         = CFE_EVS_EventType_INFORMATION,
-     .EventID           = 0,
-     .EventText         = {" "},
-     .RPNEquation =
-         {/* (WP_0) */
-          0, LC_RPN_EQUAL}},
+         {/* (WP_3) */
+          3, LC_RPN_EQUAL}},
 
     /* #3 (unused) */
     {.DefaultState      = LC_APSTATE_NOT_USED,

@@ -130,7 +130,7 @@ endif ()
 # all the CFS apps.  RISCV-64 is selected as the platform
 # to line up with expectations of next-gen flight hardware.
 SET(cpu1_PROCESSORID 1)
-SET(cpu1_APPLIST ci_lab to_lab sch_lab)
+SET(cpu1_APPLIST ci_lab to_lab sch_lab gnc_app)
 SET(cpu1_SYSTEM riscv64-poky-linux)
 
 # The "cpu2" is a contrived example of a helper system,
