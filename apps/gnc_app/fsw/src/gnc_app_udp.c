@@ -174,42 +174,68 @@ void GNC_APP_OpenCmdSocket(void)
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 /*                                                                           */
-/* GNC_APP_SendCommand — sends an 8-byte timed thruster command to Unity    */
+/* GNC_APP_SendCommand — packs a body-frame wrench into a 32-byte UDP       */
+/* packet and sends it to Unity (Phase 6-5).                                 */
 /*                                                                           */
-/* Packet layout matches UdpCommandReceiver.cs exactly:                     */
-/*   bytes [0-3]  int32  ThrusterMask   little-endian                       */
-/*   bytes [4-7]  float  BurnDuration_s IEEE 754 little-endian              */
+/* Packet layout (32 bytes, little-endian):                                  */
+/*   bytes [ 0- 3]  float  Fx  N   body-frame force                        */
+/*   bytes [ 4- 7]  float  Fy  N                                            */
+/*   bytes [ 8-11]  float  Fz  N                                            */
+/*   bytes [12-15]  float  Tx  N·m body-frame torque                       */
+/*   bytes [16-19]  float  Ty  N·m                                         */
+/*   bytes [20-23]  float  Tz  N·m                                         */
+/*   bytes [24-27]  float  Duration_s                                       */
+/*   bytes [28-31]  int32  Phase  GNC_Phase_t (0=IDLE…4=HOLD)              */
 /*                                                                           */
-/* Unity fires each active thruster for exactly BurnDuration_s seconds,     */
-/* then auto-cuts off — it does NOT wait for a "stop" command.              */
-/* Sending mask=0 / duration=0.0 is a heartbeat that resets the cFS         */
-/* command timeout without firing any thrusters (coast command).            */
+/* A zero-initialised GNC_Control_t produces a coast/heartbeat packet.      */
+/* Unity's ThrusterAllocator pseudo-inverse maps the wrench to thrusters.   */
 /*                                                                           */
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
-void GNC_APP_SendCommand(int32 mask, float duration_s)
+void GNC_APP_SendCommand(const GNC_Control_t *ctrl)
 {
-    int32 OsStatus;
-    uint8 buf[8];
+    int32  OsStatus;
+    uint8  buf[32];
+    int32  phase;
 
-    /* Union lets us reinterpret the float bits as uint32 without UB */
-    union { float f; uint32 u; } dur;
+    /* Union lets us reinterpret float bits as uint32 without UB */
+    union { float f; uint32 u; } f32;
 
     if (!GNC_APP_Data.CmdSocketReady)
         return;
 
-    dur.f = duration_s;
+    phase = (int32)GNC_APP_Data.Phase;
 
-    /* bytes [0-3]: thruster bitmask, little-endian int32 */
-    buf[0] = (uint8)( mask        & 0xFF);
-    buf[1] = (uint8)((mask >>  8) & 0xFF);
-    buf[2] = (uint8)((mask >> 16) & 0xFF);
-    buf[3] = (uint8)((mask >> 24) & 0xFF);
+    /* ── Pack 32-byte packet, little-endian ───────────────────────────── */
+    f32.f = ctrl->Fx;
+    buf[ 0]=(uint8)( f32.u        &0xFF); buf[ 1]=(uint8)((f32.u>> 8)&0xFF);
+    buf[ 2]=(uint8)((f32.u>>16)   &0xFF); buf[ 3]=(uint8)((f32.u>>24)&0xFF);
 
-    /* bytes [4-7]: burn duration, little-endian IEEE 754 float */
-    buf[4] = (uint8)( dur.u        & 0xFF);
-    buf[5] = (uint8)((dur.u >>  8) & 0xFF);
-    buf[6] = (uint8)((dur.u >> 16) & 0xFF);
-    buf[7] = (uint8)((dur.u >> 24) & 0xFF);
+    f32.f = ctrl->Fy;
+    buf[ 4]=(uint8)( f32.u        &0xFF); buf[ 5]=(uint8)((f32.u>> 8)&0xFF);
+    buf[ 6]=(uint8)((f32.u>>16)   &0xFF); buf[ 7]=(uint8)((f32.u>>24)&0xFF);
+
+    f32.f = ctrl->Fz;
+    buf[ 8]=(uint8)( f32.u        &0xFF); buf[ 9]=(uint8)((f32.u>> 8)&0xFF);
+    buf[10]=(uint8)((f32.u>>16)   &0xFF); buf[11]=(uint8)((f32.u>>24)&0xFF);
+
+    f32.f = ctrl->Tx;
+    buf[12]=(uint8)( f32.u        &0xFF); buf[13]=(uint8)((f32.u>> 8)&0xFF);
+    buf[14]=(uint8)((f32.u>>16)   &0xFF); buf[15]=(uint8)((f32.u>>24)&0xFF);
+
+    f32.f = ctrl->Ty;
+    buf[16]=(uint8)( f32.u        &0xFF); buf[17]=(uint8)((f32.u>> 8)&0xFF);
+    buf[18]=(uint8)((f32.u>>16)   &0xFF); buf[19]=(uint8)((f32.u>>24)&0xFF);
+
+    f32.f = ctrl->Tz;
+    buf[20]=(uint8)( f32.u        &0xFF); buf[21]=(uint8)((f32.u>> 8)&0xFF);
+    buf[22]=(uint8)((f32.u>>16)   &0xFF); buf[23]=(uint8)((f32.u>>24)&0xFF);
+
+    f32.f = ctrl->duration_s;
+    buf[24]=(uint8)( f32.u        &0xFF); buf[25]=(uint8)((f32.u>> 8)&0xFF);
+    buf[26]=(uint8)((f32.u>>16)   &0xFF); buf[27]=(uint8)((f32.u>>24)&0xFF);
+
+    buf[28]=(uint8)( phase        &0xFF); buf[29]=(uint8)((phase>> 8)&0xFF);
+    buf[30]=(uint8)((phase>>16)   &0xFF); buf[31]=(uint8)((phase>>24)&0xFF);
 
     OsStatus = OS_SocketSendTo(GNC_APP_Data.CmdSocketId,
                                buf, sizeof(buf),

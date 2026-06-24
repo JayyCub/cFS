@@ -62,6 +62,7 @@
 #define GNC_THRUSTER_FORCE    10.0f   /* N per thruster — must match RCSModel.thrusterForce */
 #define GNC_VEHICLE_MASS     200.0f   /* kg — must match Rigidbody mass in Unity inspector */
 #define GNC_ROT_ACCEL          0.30f  /* rad/s² per attitude thruster — tune to match Unity */
+#define GNC_RCS_MOMENT_ARM     1.5f   /* m — thruster pod radius used in mask→wrench conversion; must match Unity scene */
 
 #define GNC_MIN_BURN_DURATION  0.050f /* s — pulses shorter than this are skipped (coast) */
 #define GNC_MAX_BURN_DURATION  0.950f /* s — caps burn so thruster stops before next 1 Hz tick */
@@ -89,6 +90,17 @@
 */
 #define GNC_LAT_APPROACH_GATE  0.50f /* m — enter APPROACH when lateral offset drops below this */
 #define GNC_LAT_CORRECT_GATE   1.00f /* m — enter LATERAL_CORRECT when offset rises above this  */
+
+/*
+** Attitude PD controller gains
+**
+** AttKp maps attitude error (radians) to a target angular rate (rad/s).
+** The D term is provided implicitly by AngVel in the telemetry — same structure
+** as the lateral channels (omega_tgt = Kp × error; omega_err = omega_tgt − AngVel).
+** MaxAttRate caps the commanded angular velocity on each axis.
+*/
+#define GNC_ATT_KP       0.50f   /* (rad/s)/rad — attitude proportional gain     */
+#define GNC_MAX_ATT_RATE 0.20f   /* rad/s — cap on commanded attitude rate        */
 
 /*
 ** Orbital mechanics constant for CW feedforward (Phase 5E)
@@ -183,7 +195,7 @@ typedef enum
 
 /*
 ** Unity telemetry packet — must match UdpTelemetrySender.cs BuildPacket() exactly.
-** 14 floats (56 bytes) + 1 int32 (4 bytes) = 60 bytes, little-endian.
+** 17 floats (68 bytes) + 1 int32 (4 bytes) = 72 bytes, little-endian.
 ** __attribute__((packed)) prevents compiler from inserting any padding.
 */
 typedef struct __attribute__((packed))
@@ -203,6 +215,9 @@ typedef struct __attribute__((packed))
     float AngVel_Y;
     float AngVel_Z;
     int32 Flags;            /* bit 0 = InCorridor, bit 1 = Docked */
+    float PitchError_deg;   /* per-axis attitude errors [-180, 180]; 0 = aligned */
+    float YawError_deg;
+    float RollError_deg;
 } GNC_APP_UnityTlm_t;
 
 /*
@@ -267,8 +282,9 @@ extern GNC_APP_Data_t GNC_APP_Data;
 */
 typedef struct
 {
-    int32 mask;        /* 12-bit thruster bitmask (same bit assignments as RCSModel.cs) */
-    float duration_s;  /* seconds to hold each active thruster ON; 0.0 = coast */
+    float Fx, Fy, Fz;   /* body-frame force  (N)   — positive = +axis direction */
+    float Tx, Ty, Tz;   /* body-frame torque (N·m) — positive = +axis direction */
+    float duration_s;    /* seconds each fired thruster fires; 0.0 = coast        */
 } GNC_Control_t;
 
 /*
@@ -280,6 +296,9 @@ void         GNC_APP_ProcessWakeup(void);
 void         GNC_APP_ProcessCmd(CFE_SB_Buffer_t *MsgBuf);
 void         GNC_APP_UdpRecvTask(void);
 void         GNC_APP_OpenCmdSocket(void);
-void         GNC_APP_SendCommand(int32 mask, float duration_s);
+/* Phase 6-5: takes the body-frame wrench directly — no bitmask conversion.
+** Packs Fx,Fy,Fz,Tx,Ty,Tz,duration,phase into a 32-byte UDP packet for Unity.
+** Unity's pseudo-inverse allocator maps the wrench to physical thrusters. */
+void         GNC_APP_SendCommand(const GNC_Control_t *ctrl);
 
 #endif /* GNC_APP_H */

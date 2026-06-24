@@ -22,25 +22,51 @@ GNC_ParamTbl_t GNC_ParamTbl =
     .MaxCloseSpeed   = 0.30f,   /* cap on approach speed (m/s)                   */
 
     /* Physical model — must match Unity Inspector */
-    .ThrusterForce   = 10.0f,   /* N per thruster                                */
-    .VehicleMass     = 200.0f,  /* kg                                            */
-    .RotAccel        = 0.30f,   /* rad/s² per attitude thruster                  */
+    .ThrusterForce   = 400.0f,  /* N per thruster — real Draco thruster          */
+    .VehicleMass     = 4500.0f, /* kg — Dragon 2 capsule + trunk + crew          */
+    .RotAccel        = 0.033f,  /* rad/s² — derived: 400 N × ~1.5 m arm / 18000 kg·m²
+                                   I_pitch = m(3r²+l²)/12 = 4500×(12+36)/12 = 18000
+                                   Scale from old: 0.394 × (400/10) × (38/18000) = 0.033
+                                   Recalibrate empirically if rotation feels off   */
 
     /* Burn duration limits */
     .MinBurnDuration = 0.050f,  /* s — shorter pulses are skipped (coast)        */
     .MaxBurnDuration = 0.950f,  /* s — cap so burn ends before next 1 Hz tick    */
 
     /* Lateral position controller */
-    .LatKp           = 0.05f,   /* lateral speed = KP × position error           */
-    .MaxLatSpeed     = 0.10f,   /* lateral speed cap (m/s)                       */
+    .LatKp           = 0.02f,   /* lateral speed = KP × position error           */
+    .MaxLatSpeed     = 0.05f,   /* lateral speed cap (m/s)                       */
+    /* Reduced from 0.05/0.10 — slower lateral correction means less thruster     */
+    /* force per cycle, which reduces the axial-coupling drift that was causing   */
+    /* the vehicle to recede from the ISS during lateral correction.              */
 
     /* Phase gate hysteresis pair */
-    .LatApproachGate = 0.50f,   /* m — enter APPROACH when lateral offset < this */
-    .LatCorrectGate  = 1.00f,   /* m — enter CORRECT when lateral offset > this  */
+    .LatApproachGate = 1.00f,   /* m — enter APPROACH when lateral offset < this */
+    .LatCorrectGate  = 1.50f,   /* m — enter CORRECT when lateral offset > this  */
+    /* Increased from 0.5/1.0 — vehicle transitions to APPROACH from 1 m instead
+       of 0.5 m.  In APPROACH the lateral channel switches to velocity-damping only
+       (no position feedback), so the vehicle drifts naturally through the axis.
+       The wider gate means the coasting phase starts sooner and the vehicle has
+       more time to settle before close approach.                                   */
 
     /* Autonomous hold-point waypoints — set to 0.0 to disable */
     .HoldPoint1_m    = 10.0f,   /* m — outer waypoint; GNC pauses here for GO    */
     .HoldPoint2_m    =  3.0f,   /* m — inner waypoint; GNC pauses here for GO    */
+
+    /* Attitude PD controller */
+    .AttKp           =  0.25f,  /* (rad/s)/rad — reduced to limit overshoot      */
+    .MaxAttRate      =  0.20f,  /* rad/s — cap per axis                          */
+
+    /* Attitude deadband — breaks the lateral↔attitude coupling limit cycle      */
+    .AttDeadband_deg =  2.0f,   /* deg — skip correction when all errors < this  */
+    /* In APPROACH phase the code tightens this to 0.5× (1.0°) automatically so
+       attitude is held more precisely as the vehicle closes on the port.          */
+
+    /* Lateral velocity deadband — prevents bang-bang chatter at small errors     */
+    .LatVelDeadband_ms = 0.015f, /* m/s — coast when velocity error is this small */
+    /* The limit cycle: lateral burn disturbs roll ~0.5–1°; at AttKp=0.50 that   */
+    /* fires a correction every cycle; the correction couples back into lateral.  */
+    /* With a 2° deadband, sub-2° perturbations coast rather than being fought.  */
 };
 
 /*

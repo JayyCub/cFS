@@ -302,8 +302,9 @@ static GNC_Phase_t GNC_APP_SelectPhase(const GNC_APP_UnityTlm_t *tlm, GNC_Phase_
 /*       dur       = |v_lat_tgt - Vel_XY| / accel                           */
 /*     Pos_X/Y serve as lateral errors (world-origin / fixed-target assumed).*/
 /*                                                                           */
-/*   Channel 3 — Attitude rate damping (all phases)                         */
-/*     dur = |AngVel| / GNC_ROT_ACCEL                                        */
+/*   Channel 3 — Attitude PD (all phases)                                    */
+/*     omega_tgt = clamp(AttKp × error_rad, ±MaxAttRate)                     */
+/*     dur       = |omega_tgt − AngVel| / RotAccel                           */
 /*                                                                           */
 /* Duration is the maximum across all active channels so the dominant        */
 /* correction is exact; shorter-needed axes are slightly over-fired but self-*/
@@ -315,8 +316,9 @@ static GNC_Phase_t GNC_APP_SelectPhase(const GNC_APP_UnityTlm_t *tlm, GNC_Phase_
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 static GNC_Control_t GNC_APP_ComputeControl(const GNC_APP_UnityTlm_t *tlm, GNC_Phase_t phase)
 {
-    GNC_Control_t         ctrl    = {0, 0.0f};
-    float                 max_dur = 0.0f;
+    GNC_Control_t         ctrl         = {0};
+    float                 max_trans_dur = 0.0f;  /* longest needed by translational channels */
+    float                 max_att_dur   = 0.0f;  /* longest needed by attitude channels      */
     float                 dur;
     float                 ff_x, ff_y, ff_z;  /* CW feedforward delta-v (m/s) per axis */
 
@@ -328,6 +330,8 @@ static GNC_Control_t GNC_APP_ComputeControl(const GNC_APP_UnityTlm_t *tlm, GNC_P
     ** ParamTblPtr is guaranteed non-NULL after a successful Init. */
     const GNC_ParamTbl_t *p     = GNC_APP_Data.ParamTblPtr;
     float                 accel = p->ThrusterForce / p->VehicleMass;  /* m/s² per thruster */
+    float                 kF    = p->ThrusterForce;
+    float                 kT    = kF * GNC_RCS_MOMENT_ARM;
 
     /* === CW Feedforward ============================================== */
     /* ClohessyWiltshire.cs applies the differential gravity equations    */
@@ -369,93 +373,208 @@ static GNC_Control_t GNC_APP_ComputeControl(const GNC_APP_UnityTlm_t *tlm, GNC_P
         if (v_axial_err > 0.0f)
         {
             dur = v_axial_err / accel;
-            if (dur >= p->MinBurnDuration) { ctrl.mask |= (1 << 4); if (dur > max_dur) max_dur = dur; }
+            if (dur >= p->MinBurnDuration) { ctrl.Fz += kF; if (dur > max_trans_dur) max_trans_dur = dur; }
         }
         else if (v_axial_err < 0.0f)
         {
             dur = -v_axial_err / accel;
-            if (dur >= p->MinBurnDuration) { ctrl.mask |= (1 << 5); if (dur > max_dur) max_dur = dur; }
+            if (dur >= p->MinBurnDuration) { ctrl.Fz -= kF; if (dur > max_trans_dur) max_trans_dur = dur; }
         }
     }
 
     /* === Channel 2 — Lateral position + velocity (X and Y) =========== */
     /*                                                                    */
-    /* Target lateral velocity is proportional to the lateral position   */
-    /* error (Pos_X / Pos_Y), clamped to MaxLatSpeed.  The burn then     */
-    /* closes the gap between that target and the measured lateral vel.  */
+    /* LAT_CORR phase: position + velocity feedback.                     */
+    /*   Target velocity = clamp(-LatKp × Pos_XY, ±MaxLatSpeed)         */
+    /*   Velocity error drives the burn duration.                        */
+    /*                                                                    */
+    /* APPROACH phase: velocity-damp only (no position feedback).        */
+    /*   Target velocity = 0 — null out any residual lateral velocity.  */
+    /*   Once the vehicle is near the axis it drifts through naturally   */
+    /*   without being pulled back and forth by a position P-term.       */
+    /*                                                                    */
+    /* Velocity deadband: skip the burn when the velocity error is small */
+    /* enough that the minimum 400 N impulse would overshoot.  Without   */
+    /* this, the controller alternates ±400 N every cycle (bang-bang     */
+    /* chatter) whenever it is near the target velocity.                 */
     {
+        float db = p->LatVelDeadband_ms;   /* m/s — coasting threshold */
+
         /* X axis */
-        float v_lat_tgt_X = -p->LatKp * tlm->Pos_X;
-        if (v_lat_tgt_X >  p->MaxLatSpeed) v_lat_tgt_X =  p->MaxLatSpeed;
-        if (v_lat_tgt_X < -p->MaxLatSpeed) v_lat_tgt_X = -p->MaxLatSpeed;
+        float v_lat_tgt_X;
+        if (phase == GNC_PHASE_APPROACH)
+        {
+            v_lat_tgt_X = 0.0f;           /* damp lateral velocity, don't position-correct */
+        }
+        else
+        {
+            v_lat_tgt_X = -p->LatKp * tlm->Pos_X;
+            if (v_lat_tgt_X >  p->MaxLatSpeed) v_lat_tgt_X =  p->MaxLatSpeed;
+            if (v_lat_tgt_X < -p->MaxLatSpeed) v_lat_tgt_X = -p->MaxLatSpeed;
+        }
 
         float v_lat_err_X = v_lat_tgt_X - tlm->Vel_X + ff_x;
-        if (v_lat_err_X > 0.0f)
+        if (v_lat_err_X > db)
         {
-            dur = v_lat_err_X / accel;
-            if (dur >= p->MinBurnDuration) { ctrl.mask |= (1 << 0); if (dur > max_dur) max_dur = dur; }
+            dur = (v_lat_err_X - db) / accel;
+            if (dur >= p->MinBurnDuration) { ctrl.Fx += kF; if (dur > max_trans_dur) max_trans_dur = dur; }
         }
-        else if (v_lat_err_X < 0.0f)
+        else if (v_lat_err_X < -db)
         {
-            dur = -v_lat_err_X / accel;
-            if (dur >= p->MinBurnDuration) { ctrl.mask |= (1 << 1); if (dur > max_dur) max_dur = dur; }
+            dur = (-v_lat_err_X - db) / accel;
+            if (dur >= p->MinBurnDuration) { ctrl.Fx -= kF; if (dur > max_trans_dur) max_trans_dur = dur; }
         }
 
         /* Y axis */
-        float v_lat_tgt_Y = -p->LatKp * tlm->Pos_Y;
-        if (v_lat_tgt_Y >  p->MaxLatSpeed) v_lat_tgt_Y =  p->MaxLatSpeed;
-        if (v_lat_tgt_Y < -p->MaxLatSpeed) v_lat_tgt_Y = -p->MaxLatSpeed;
+        float v_lat_tgt_Y;
+        if (phase == GNC_PHASE_APPROACH)
+        {
+            v_lat_tgt_Y = 0.0f;
+        }
+        else
+        {
+            v_lat_tgt_Y = -p->LatKp * tlm->Pos_Y;
+            if (v_lat_tgt_Y >  p->MaxLatSpeed) v_lat_tgt_Y =  p->MaxLatSpeed;
+            if (v_lat_tgt_Y < -p->MaxLatSpeed) v_lat_tgt_Y = -p->MaxLatSpeed;
+        }
 
         float v_lat_err_Y = v_lat_tgt_Y - tlm->Vel_Y + ff_y;
-        if (v_lat_err_Y > 0.0f)
+        if (v_lat_err_Y > db)
         {
-            dur = v_lat_err_Y / accel;
-            if (dur >= p->MinBurnDuration) { ctrl.mask |= (1 << 2); if (dur > max_dur) max_dur = dur; }
+            dur = (v_lat_err_Y - db) / accel;
+            if (dur >= p->MinBurnDuration) { ctrl.Fy += kF; if (dur > max_trans_dur) max_trans_dur = dur; }
         }
-        else if (v_lat_err_Y < 0.0f)
+        else if (v_lat_err_Y < -db)
         {
-            dur = -v_lat_err_Y / accel;
-            if (dur >= p->MinBurnDuration) { ctrl.mask |= (1 << 3); if (dur > max_dur) max_dur = dur; }
+            dur = (-v_lat_err_Y - db) / accel;
+            if (dur >= p->MinBurnDuration) { ctrl.Fy -= kF; if (dur > max_trans_dur) max_trans_dur = dur; }
         }
     }
 
-    /* === Channel 3 — Attitude rate damping (all active phases) ======= */
+    /* === Channel 3 — Attitude PD (all active phases) =================== */
+    /*                                                                      */
+    /* P term: target angular rate = AttKp × attitude error (rad).         */
+    /* D term: provided by AngVel — same structure as the lateral channels: */
+    /*   omega_tgt = clamp(Kp × error, ±MaxAttRate)                        */
+    /*   omega_err = omega_tgt - AngVel                                     */
+    /*   duration  = |omega_err| / RotAccel                                 */
+    /*                                                                      */
+    /* Deadband: attitude corrections are skipped when all three errors are */
+    /* below AttDeadband_deg AND the vehicle is not spinning fast (>0.01   */
+    /* rad/s on any axis).  This breaks the lateral↔attitude limit cycle:  */
+    /* lateral burns disturb attitude ~0.5–1°; without a deadband the      */
+    /* controller fires corrective burns every Hz cycle, and those burns    */
+    /* couple back into lateral and roll, sustaining the oscillation.      */
     {
-        if (tlm->AngVel_X > 0.0f)
+        const float kp    = p->AttKp;
+        const float max_w = p->MaxAttRate;
+        const float d2r   = 0.01745329f;  /* π / 180 */
+        float       omega_tgt, omega_err;
+
+        /* Tighten attitude deadband during approach — keep the nose pointed
+        ** at the port.  LAT_CORR uses the full deadband to avoid fighting
+        ** coupling perturbations; APPROACH halves it for precision. */
+        float       att_db_deg = (phase == GNC_PHASE_APPROACH)
+                                 ? p->AttDeadband_deg * 0.5f
+                                 : p->AttDeadband_deg;
+        float       db_rad   = att_db_deg * d2r;
+        bool        spinning = (tlm->AngVel_X >  0.01f || tlm->AngVel_X < -0.01f ||
+                                tlm->AngVel_Y >  0.01f || tlm->AngVel_Y < -0.01f ||
+                                tlm->AngVel_Z >  0.01f || tlm->AngVel_Z < -0.01f);
+        bool        in_db    = (db_rad > 0.0f &&
+                                tlm->PitchError_deg * d2r >  -db_rad &&
+                                tlm->PitchError_deg * d2r <   db_rad &&
+                                tlm->YawError_deg   * d2r >  -db_rad &&
+                                tlm->YawError_deg   * d2r <   db_rad &&
+                                tlm->RollError_deg  * d2r >  -db_rad &&
+                                tlm->RollError_deg  * d2r <   db_rad);
+        /* Skip attitude correction only when all errors are small AND not spinning */
+        if (in_db && !spinning) goto attitude_done;
+
+        /* Pitch — X axis */
+        omega_tgt = kp * (tlm->PitchError_deg * d2r);
+        if (omega_tgt >  max_w) omega_tgt =  max_w;
+        if (omega_tgt < -max_w) omega_tgt = -max_w;
+        omega_err = omega_tgt - tlm->AngVel_X;
+        if (omega_err > 0.0f)
         {
-            dur = tlm->AngVel_X / p->RotAccel;
-            if (dur >= p->MinBurnDuration) { ctrl.mask |= (1 << 7); if (dur > max_dur) max_dur = dur; }
+            dur = omega_err / p->RotAccel;
+            if (dur >= p->MinBurnDuration) { ctrl.Tx += kT; if (dur > max_att_dur) max_att_dur = dur; }
         }
-        else if (tlm->AngVel_X < 0.0f)
+        else if (omega_err < 0.0f)
         {
-            dur = -tlm->AngVel_X / p->RotAccel;
-            if (dur >= p->MinBurnDuration) { ctrl.mask |= (1 << 6); if (dur > max_dur) max_dur = dur; }
+            dur = -omega_err / p->RotAccel;
+            if (dur >= p->MinBurnDuration) { ctrl.Tx -= kT; if (dur > max_att_dur) max_att_dur = dur; }
         }
 
-        if (tlm->AngVel_Y > 0.0f)
+        /* Yaw — Y axis */
+        omega_tgt = kp * (tlm->YawError_deg * d2r);
+        if (omega_tgt >  max_w) omega_tgt =  max_w;
+        if (omega_tgt < -max_w) omega_tgt = -max_w;
+        omega_err = omega_tgt - tlm->AngVel_Y;
+        if (omega_err > 0.0f)
         {
-            dur = tlm->AngVel_Y / p->RotAccel;
-            if (dur >= p->MinBurnDuration) { ctrl.mask |= (1 << 9); if (dur > max_dur) max_dur = dur; }
+            dur = omega_err / p->RotAccel;
+            if (dur >= p->MinBurnDuration) { ctrl.Ty += kT; if (dur > max_att_dur) max_att_dur = dur; }
         }
-        else if (tlm->AngVel_Y < 0.0f)
+        else if (omega_err < 0.0f)
         {
-            dur = -tlm->AngVel_Y / p->RotAccel;
-            if (dur >= p->MinBurnDuration) { ctrl.mask |= (1 << 8); if (dur > max_dur) max_dur = dur; }
+            dur = -omega_err / p->RotAccel;
+            if (dur >= p->MinBurnDuration) { ctrl.Ty -= kT; if (dur > max_att_dur) max_att_dur = dur; }
         }
 
-        if (tlm->AngVel_Z > 0.0f)
+        /* Roll — Z axis */
+        omega_tgt = kp * (tlm->RollError_deg * d2r);
+        if (omega_tgt >  max_w) omega_tgt =  max_w;
+        if (omega_tgt < -max_w) omega_tgt = -max_w;
+        omega_err = omega_tgt - tlm->AngVel_Z;
+        if (omega_err > 0.0f)
         {
-            dur = tlm->AngVel_Z / p->RotAccel;
-            if (dur >= p->MinBurnDuration) { ctrl.mask |= (1 << 11); if (dur > max_dur) max_dur = dur; }
+            dur = omega_err / p->RotAccel;
+            if (dur >= p->MinBurnDuration) { ctrl.Tz += kT; if (dur > max_att_dur) max_att_dur = dur; }
         }
-        else if (tlm->AngVel_Z < 0.0f)
+        else if (omega_err < 0.0f)
         {
-            dur = -tlm->AngVel_Z / p->RotAccel;
-            if (dur >= p->MinBurnDuration) { ctrl.mask |= (1 << 10); if (dur > max_dur) max_dur = dur; }
+            dur = -omega_err / p->RotAccel;
+            if (dur >= p->MinBurnDuration) { ctrl.Tz -= kT; if (dur > max_att_dur) max_att_dur = dur; }
+        }
+    }
+    attitude_done:;
+
+    /*
+    ** Resolve shared burn duration.
+    **
+    ** Translational and attitude channels may need different burn durations.
+    ** Sending a single wrench with one duration means whichever channel drives
+    ** max_dur over-fires all other channels.  Scale each group's commands down
+    ** so the angular/linear impulse is correct regardless of which group wins.
+    **
+    ** Example: lateral needs 2 s (capped to 0.95 s), attitude needs 0.58 s.
+    ** Without scaling, attitude torques would fire 0.95 s and impart 1.6× too
+    ** much angular velocity, causing the growing oscillation seen in telemetry.
+    */
+    float max_dur = (max_trans_dur > max_att_dur) ? max_trans_dur : max_att_dur;
+    if (max_dur > p->MaxBurnDuration) max_dur = p->MaxBurnDuration;
+
+    if (max_dur > 0.0f)
+    {
+        if (max_att_dur > 0.0f && max_att_dur < max_dur)
+        {
+            float scale = max_att_dur / max_dur;
+            ctrl.Tx *= scale;
+            ctrl.Ty *= scale;
+            ctrl.Tz *= scale;
+        }
+        if (max_trans_dur > 0.0f && max_trans_dur < max_dur)
+        {
+            float scale = max_trans_dur / max_dur;
+            ctrl.Fx *= scale;
+            ctrl.Fy *= scale;
+            ctrl.Fz *= scale;
         }
     }
 
-    ctrl.duration_s = (max_dur > p->MaxBurnDuration) ? p->MaxBurnDuration : max_dur;
+    ctrl.duration_s = max_dur;
     return ctrl;
 }
 
@@ -476,7 +595,7 @@ void GNC_APP_ProcessWakeup(void)
 
     GNC_APP_UnityTlm_t tlm;
     bool               fresh;
-    GNC_Control_t      ctrl = {0, 0.0f};
+    GNC_Control_t      ctrl = {0};
 
     GNC_APP_Data.HkTlm.WakeupCount++;
 
@@ -555,29 +674,34 @@ void GNC_APP_ProcessWakeup(void)
 
         /* Run the control law for the active phase and command Unity */
         ctrl = GNC_APP_ComputeControl(&tlm, GNC_APP_Data.Phase);
-        GNC_APP_SendCommand(ctrl.mask, ctrl.duration_s);
+        GNC_APP_SendCommand(&ctrl);
         GNC_APP_Data.HkTlm.CmdCount++;
 
         int inCorridor = (tlm.Flags & 0x1) != 0;
         int docked     = (tlm.Flags & 0x2) != 0;
 
         CFE_EVS_SendEvent(GNC_APP_WAKEUP_INF_EID, CFE_EVS_EventType_INFORMATION,
-                          "GNC #%u [%s] | Rng=%.2f Spd=%.3f Lat=%.3f Att=%.1f | "
-                          "Cor=%d Dkd=%d | Cmd=0x%03X Dur=%.3fs",
+                          "GNC #%u [%s] | Rng=%.2f Spd=%.3f Lat=%.3f | "
+                          "P=%.1f Y=%.1f R=%.1f | "
+                          "Cor=%d Dkd=%d | F=(%.0f,%.0f,%.0f) T=(%.0f,%.0f,%.0f) Dur=%.3fs",
                           (unsigned int)GNC_APP_Data.HkTlm.WakeupCount,
                           PHASE_NAMES[GNC_APP_Data.Phase],
                           (double)tlm.Range_m,
                           (double)tlm.ClosingSpeed_ms,
                           (double)tlm.LateralOffset_m,
-                          (double)tlm.AttitudeError_deg,
+                          (double)tlm.PitchError_deg,
+                          (double)tlm.YawError_deg,
+                          (double)tlm.RollError_deg,
                           inCorridor, docked,
-                          (unsigned int)ctrl.mask,
+                          (double)ctrl.Fx, (double)ctrl.Fy, (double)ctrl.Fz,
+                          (double)ctrl.Tx, (double)ctrl.Ty, (double)ctrl.Tz,
                           (double)ctrl.duration_s);
     }
     else
     {
         /* Send a zero command — Unity coasts and keeps the cFS timeout alive */
-        GNC_APP_SendCommand(0, 0.0f);
+        GNC_Control_t coast = {0};
+        GNC_APP_SendCommand(&coast);
         GNC_APP_Data.HkTlm.TlmStaleSec++;
 
         CFE_EVS_SendEvent(GNC_APP_WAKEUP_INF_EID, CFE_EVS_EventType_INFORMATION,
@@ -700,7 +824,7 @@ void GNC_APP_ProcessCmd(CFE_SB_Buffer_t *MsgBuf)
             GNC_APP_Data.Phase          = GNC_PHASE_IDLE;
             GNC_APP_Data.AbortLatch     = true;
             GNC_APP_Data.HkTlm.Phase    = (uint8)GNC_PHASE_IDLE;
-            GNC_APP_SendCommand(0, 0.0f);  /* immediate coast — do not wait for next wakeup */
+            { GNC_Control_t coast = {0}; GNC_APP_SendCommand(&coast); }  /* immediate coast */
             CFE_EVS_SendEvent(GNC_APP_ABORT_INF_EID, CFE_EVS_EventType_CRITICAL,
                               "GNC_APP: *** ABORT *** all thrust inhibited — send GO to resume");
             break;

@@ -23,7 +23,7 @@
 ** set in the Unity Inspector (RCSModel.thrusterForce and Rigidbody mass).
 ** If they drift, every burn duration will be systematically wrong.
 **
-** Layout: 14 × float = 56 bytes. Naturally 4-byte aligned; no padding required.
+** Layout: 18 × float = 72 bytes. Naturally 4-byte aligned; no padding required.
 */
 typedef struct
 {
@@ -68,6 +68,36 @@ typedef struct
     */
     float HoldPoint1_m;     /* m — outer proximity-ops waypoint (e.g. 10 m)    */
     float HoldPoint2_m;     /* m — inner proximity-ops waypoint (e.g.  3 m)    */
+
+    /*
+    ** Attitude PD controller
+    ** AttKp: target angular rate = AttKp × attitude error (rad).
+    ** MaxAttRate: clamp on commanded angular rate (rad/s) per axis.
+    */
+    float AttKp;            /* (rad/s)/rad — attitude proportional gain         */
+    float MaxAttRate;       /* rad/s — max commanded angular rate per axis      */
+
+    /*
+    ** Attitude deadband
+    ** Attitude corrections are suppressed on all axes when ALL three errors
+    ** (pitch, yaw, roll) are within this threshold in degrees AND the vehicle
+    ** is not spinning fast.  This breaks the limit cycle caused by lateral
+    ** correction burns disturbing attitude, which then triggers corrective burns
+    ** that themselves couple back into lateral — the core feedback loop.
+    ** Set to 0.0 to disable (always correct attitude, old behaviour).
+    */
+    float AttDeadband_deg;  /* deg — skip attitude correction below this error  */
+
+    /*
+    ** Lateral velocity deadband
+    ** Only fire a lateral correction burn when the velocity error exceeds this
+    ** threshold.  Without it, 400 N thrusters at 1 Hz create a bang-bang
+    ** limit cycle: each impulse overshoots the target lateral velocity, the
+    ** next cycle fires the opposite direction, and so on — visible as F_x
+    ** alternating sign every cycle.  A small deadband lets the vehicle coast
+    ** through tiny velocity errors instead of chasing them.
+    */
+    float LatVelDeadband_ms; /* m/s — ignore lateral velocity errors below this */
 
 } GNC_ParamTbl_t;
 
