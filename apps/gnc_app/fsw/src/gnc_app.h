@@ -1,6 +1,7 @@
 #ifndef GNC_APP_H
 #define GNC_APP_H
 
+#include <math.h>
 #include "cfe.h"
 #include "osapi.h"
 #include "gnc_app_msgids.h"
@@ -256,6 +257,7 @@ typedef struct
     bool               AbortLatch;   /* set by ABORT cmd; inhibits IDLE→CORRECT until GO */
     bool               HoldPt1Armed; /* true until hold point 1 fires; re-armed by ABORT+GO */
     bool               HoldPt2Armed; /* true until hold point 2 fires; re-armed by ABORT+GO */
+    float              HoldRange_m;  /* Range_m captured at HOLD entry; axial position target */
 
     /* UDP receive thread and shared telemetry state */
     osal_id_t          UdpTaskId;

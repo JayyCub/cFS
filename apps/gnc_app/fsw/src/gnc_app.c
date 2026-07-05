@@ -252,20 +252,20 @@ static GNC_Phase_t GNC_APP_SelectPhase(const GNC_APP_UnityTlm_t *tlm, GNC_Phase_
     if (next == GNC_PHASE_APPROACH)
     {
         const GNC_ParamTbl_t *p     = GNC_APP_Data.ParamTblPtr;
-        float                 accel = p->ThrusterForce / p->VehicleMass;
         float                 v     = (tlm->ClosingSpeed_ms > 0.0f) ? tlm->ClosingSpeed_ms : 0.0f;
         /* Distance needed to brake to a stop from current closing speed.
+        ** BrakeAccel_Hard_mss is the actual deceleration from all 8 brake thrusters
+        ** (T08-T15) in Unity — calibrated from thruster geometry, not ThrusterForce.
         ** The continuous-thrust formula is v²/(2a), but the 1 Hz discrete control
-        ** loop achieves roughly half that deceleration in practice: the GNC can miss
-        ** the ideal trigger instant by up to one full cycle (~v×1s of extra travel),
-        ** and the 0.95s burn cap means the vehicle coasts for ~0.05s per cycle.
-        ** Empirically the actual stopping distance is ~v²/a, so we use that. */
-        float brake_dist = (v * v) / accel;
+        ** loop achieves roughly half that in practice (cycle-miss + 0.95s burn cap),
+        ** so empirically v²/a is used. */
+        float brake_dist = (v * v) / p->BrakeAccel_Hard_mss;
 
         if (GNC_APP_Data.HoldPt1Armed && p->HoldPoint1_m > 0.0f &&
             tlm->Range_m <= p->HoldPoint1_m + brake_dist)
         {
             GNC_APP_Data.HoldPt1Armed = false;
+            GNC_APP_Data.HoldRange_m  = tlm->Range_m;
             CFE_EVS_SendEvent(GNC_APP_HOLDPT1_INF_EID, CFE_EVS_EventType_INFORMATION,
                               "GNC_APP: HOLD POINT 1 — braking to %.2f m (range now %.2f m) — awaiting GO",
                               (double)p->HoldPoint1_m, (double)tlm->Range_m);
@@ -276,6 +276,7 @@ static GNC_Phase_t GNC_APP_SelectPhase(const GNC_APP_UnityTlm_t *tlm, GNC_Phase_
             tlm->Range_m <= p->HoldPoint2_m + brake_dist)
         {
             GNC_APP_Data.HoldPt2Armed = false;
+            GNC_APP_Data.HoldRange_m  = tlm->Range_m;
             CFE_EVS_SendEvent(GNC_APP_HOLDPT2_INF_EID, CFE_EVS_EventType_INFORMATION,
                               "GNC_APP: HOLD POINT 2 — braking to %.2f m (range now %.2f m) — awaiting GO",
                               (double)p->HoldPoint2_m, (double)tlm->Range_m);
@@ -294,7 +295,11 @@ static GNC_Phase_t GNC_APP_SelectPhase(const GNC_APP_UnityTlm_t *tlm, GNC_Phase_
 /*                                                                           */
 /*   Channel 1 — Axial                                                       */
 /*     APPROACH : proportional guidance  v_tgt = clamp(KP * range, min, max)*/
+/*                max is MaxCloseSpeed before HoldPoint1_m fires, then the   */
+/*                tighter MaxCloseSpeed_Inner for the remainder of approach */
 /*     CORRECT  : station-keep           v_tgt = 0 (brake if drifting in)   */
+/*     HOLD     : position + velocity    v_tgt = clamp(KP_HOLD * (range -   */
+/*                                        HoldRange_m), ±MaxHoldSpeed)      */
 /*                                                                           */
 /*   Channel 2 — Lateral (X and Y)                                          */
 /*     Both phases: position + velocity controller.                          */
@@ -355,16 +360,32 @@ static GNC_Control_t GNC_APP_ComputeControl(const GNC_APP_UnityTlm_t *tlm, GNC_P
     /*                                                                    */
     /* APPROACH: proportional guidance — target closing speed scales with */
     /*   range so the vehicle naturally slows as it closes (linear law).  */
-    /* CORRECT/HOLD: station-keep — target closing speed is zero.         */
+    /* HOLD: station-keep with position feedback toward HoldRange_m — the  */
+    /*   range captured when the hold was entered — so drift accumulated  */
+    /*   during the hold (imperfect braking, residual CW drift) is walked */
+    /*   back out instead of merely having its velocity zeroed.           */
+    /* CORRECT: station-keep — target closing speed is zero (transient    */
+    /*   phase driving toward APPROACH; no fixed range to hold yet).      */
     {
         float v_axial_tgt;
         if (phase == GNC_PHASE_APPROACH)
         {
+            /* Outer cap before HoldPoint1_m has fired, tighter cap after —
+            ** models the real-world profile of a faster outer approach speed
+            ** and a slower, more cautious speed once inside the first hold. */
+            float cap = GNC_APP_Data.HoldPt1Armed ? p->MaxCloseSpeed : p->MaxCloseSpeed_Inner;
             v_axial_tgt = tlm->Range_m * p->AxialKp;
             if (v_axial_tgt < p->MinCloseSpeed) v_axial_tgt = p->MinCloseSpeed;
-            if (v_axial_tgt > p->MaxCloseSpeed) v_axial_tgt = p->MaxCloseSpeed;
+            if (v_axial_tgt > cap) v_axial_tgt = cap;
         }
-        else /* CORRECT / HOLD — station-keep axially */
+        else if (phase == GNC_PHASE_HOLD)
+        {
+            float range_err = tlm->Range_m - GNC_APP_Data.HoldRange_m;
+            v_axial_tgt = p->AxialHoldKp * range_err;
+            if (v_axial_tgt >  p->MaxHoldSpeed) v_axial_tgt =  p->MaxHoldSpeed;
+            if (v_axial_tgt < -p->MaxHoldSpeed) v_axial_tgt = -p->MaxHoldSpeed;
+        }
+        else /* CORRECT — station-keep axially */
         {
             v_axial_tgt = 0.0f;
         }
@@ -372,13 +393,23 @@ static GNC_Control_t GNC_APP_ComputeControl(const GNC_APP_UnityTlm_t *tlm, GNC_P
         float v_axial_err = v_axial_tgt - tlm->ClosingSpeed_ms + ff_z;
         if (v_axial_err > 0.0f)
         {
-            dur = v_axial_err / accel;
+            /* Need to speed up — fire approach group (T04-T07, +Z).  kF = ThrusterForce.
+            ** Use ApproachAccel_mss (empirically measured) so the burn duration is exact
+            ** rather than over-shooting by 1.8× with the theoretical ThrusterForce/Mass. */
+            dur = v_axial_err / p->ApproachAccel_mss;
             if (dur >= p->MinBurnDuration) { ctrl.Fz += kF; if (dur > max_trans_dur) max_trans_dur = dur; }
         }
         else if (v_axial_err < 0.0f)
         {
-            dur = -v_axial_err / accel;
-            if (dur >= p->MinBurnDuration) { ctrl.Fz -= kF; if (dur > max_trans_dur) max_trans_dur = dur; }
+            /* Need to brake — choose hard or soft based on velocity error magnitude.
+            **   Hard (|err| > half MaxCloseSpeed): T08-T15, BrakeAccel_Hard_mss × mass.
+            **   Soft (fine correction): T08-T11 only, BrakeAccel_Light_mss × mass.
+            ** Unity selects the thruster group by comparing |Fz| against 43 N. */
+            bool  hard        = ((-v_axial_err) > (p->MaxCloseSpeed * 0.5f));
+            float brake_accel = hard ? p->BrakeAccel_Hard_mss : p->BrakeAccel_Light_mss;
+            float brake_force = brake_accel * p->VehicleMass;
+            dur = (-v_axial_err) / brake_accel;
+            if (dur >= p->MinBurnDuration) { ctrl.Fz -= brake_force; if (dur > max_trans_dur) max_trans_dur = dur; }
         }
     }
 
@@ -451,6 +482,23 @@ static GNC_Control_t GNC_APP_ComputeControl(const GNC_APP_UnityTlm_t *tlm, GNC_P
         }
     }
 
+    /* === Lateral-coupling +Fz feed-forward (LAT_CORR only) ============== */
+    /*                                                                        */
+    /* When actively translating in LAT_CORR, the lateral burn disturbs       */
+    /* attitude; the resulting T08-T15 corrections produce coupled −Z that    */
+    /* drives the vehicle backward faster than Channel 1 can react.           */
+    /* Add proactive +Fz proportional to the lateral force so forward thrust  */
+    /* fires in the same burst as the lateral correction rather than 1 cycle  */
+    /* later.  Coefficient 0.4: empirical — T08-T15 are ~1.7× stronger in    */
+    /* the −Z direction than T04-T07 are in +Z, so even partial compensation  */
+    /* combined with the wider deadband above keeps range stable.             */
+    if (phase == GNC_PHASE_CORRECT)
+    {
+        float lat_mag = fabsf(ctrl.Fx) + fabsf(ctrl.Fy);
+        if (lat_mag > 0.5f)
+            ctrl.Fz += 0.4f * lat_mag;
+    }
+
     /* === Channel 3 — Attitude PD (all active phases) =================== */
     /*                                                                      */
     /* P term: target angular rate = AttKp × attitude error (rad).         */
@@ -471,12 +519,16 @@ static GNC_Control_t GNC_APP_ComputeControl(const GNC_APP_UnityTlm_t *tlm, GNC_P
         const float d2r   = 0.01745329f;  /* π / 180 */
         float       omega_tgt, omega_err;
 
-        /* Tighten attitude deadband during approach — keep the nose pointed
-        ** at the port.  LAT_CORR uses the full deadband to avoid fighting
-        ** coupling perturbations; APPROACH halves it for precision. */
-        float       att_db_deg = (phase == GNC_PHASE_APPROACH)
-                                 ? p->AttDeadband_deg * 0.5f
-                                 : p->AttDeadband_deg;
+        /* Attitude deadband by phase:
+        **   LAT_CORR  2× (4°): lateral burns disturb attitude ~0.5-2°; a wider
+        **             deadband lets those perturbations coast rather than triggering
+        **             T08-T15 corrections whose -Z coupling drives the vehicle back.
+        **   APPROACH  0.5× (1°): tighten for nose-on-port precision.
+        **   HOLD      1× (2°): baseline. */
+        float       att_db_deg;
+        if      (phase == GNC_PHASE_APPROACH) att_db_deg = p->AttDeadband_deg * 0.5f;
+        else if (phase == GNC_PHASE_CORRECT)  att_db_deg = p->AttDeadband_deg * 2.0f;
+        else                                   att_db_deg = p->AttDeadband_deg;
         float       db_rad   = att_db_deg * d2r;
         bool        spinning = (tlm->AngVel_X >  0.01f || tlm->AngVel_X < -0.01f ||
                                 tlm->AngVel_Y >  0.01f || tlm->AngVel_Y < -0.01f ||
@@ -778,8 +830,10 @@ void GNC_APP_ProcessCmd(CFE_SB_Buffer_t *MsgBuf)
             GNC_APP_Data.HkTlm.CmdCount++;
             GNC_APP_Data.Phase          = GNC_PHASE_HOLD;
             GNC_APP_Data.HkTlm.Phase    = (uint8)GNC_PHASE_HOLD;
-            /* Range read without mutex — acceptable for an EVS log message */
+            /* Range read without mutex — acceptable for an EVS log message and
+            ** as the axial hold-position target (next wakeup cycle refines it) */
             float rng = GNC_APP_Data.LatestTlm.Range_m;
+            GNC_APP_Data.HoldRange_m    = rng;
             CFE_EVS_SendEvent(GNC_APP_HOLD_INF_EID, CFE_EVS_EventType_INFORMATION,
                               "GNC_APP: HOLD — station-keep at %.2f m (await GO)", (double)rng);
             break;

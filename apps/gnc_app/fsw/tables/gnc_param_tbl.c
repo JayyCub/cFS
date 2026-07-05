@@ -18,8 +18,14 @@ GNC_ParamTbl_t GNC_ParamTbl =
 {
     /* Axial guidance */
     .AxialKp         = 0.02f,   /* target closing speed = KP × range            */
-    .MinCloseSpeed   = 0.02f,   /* floor on approach speed (m/s)                 */
-    .MaxCloseSpeed   = 0.30f,   /* cap on approach speed (m/s)                   */
+    .MinCloseSpeed   = 0.10f,   /* floor on approach speed (m/s) — holds a constant
+                                   ~0.1 m/s soft-capture speed for the final stretch
+                                   instead of tapering toward zero (matches observed
+                                   SpaceX Dragon terminal closing rate)               */
+    .MaxCloseSpeed   = 0.30f,   /* outer cap, before HoldPoint1_m (m/s)          */
+    .MaxCloseSpeed_Inner = 0.10f, /* inner cap, after HoldPoint1_m fires (m/s)   */
+    /* Mirrors observed SpaceX Dragon docking profile: ~0.3 m/s outside the first
+       hold point, dropping to ~0.1 m/s once past it and re-commanded to GO.      */
 
     /* Physical model — must match Unity Inspector */
     .ThrusterForce   = 400.0f,  /* N per thruster — real Draco thruster          */
@@ -50,7 +56,7 @@ GNC_ParamTbl_t GNC_ParamTbl =
        more time to settle before close approach.                                   */
 
     /* Autonomous hold-point waypoints — set to 0.0 to disable */
-    .HoldPoint1_m    = 10.0f,   /* m — outer waypoint; GNC pauses here for GO    */
+    .HoldPoint1_m    = 20.0f,   /* m — outer waypoint; GNC pauses here for GO    */
     .HoldPoint2_m    =  3.0f,   /* m — inner waypoint; GNC pauses here for GO    */
 
     /* Attitude PD controller */
@@ -67,6 +73,27 @@ GNC_ParamTbl_t GNC_ParamTbl =
     /* The limit cycle: lateral burn disturbs roll ~0.5–1°; at AttKp=0.50 that   */
     /* fires a correction every cycle; the correction couples back into lateral.  */
     /* With a 2° deadband, sub-2° perturbations coast rather than being fought.  */
+
+    /* Braking deceleration — empirically measured from actual Unity physics.
+    ** These are NOT computed from thrusterForce × Fz_sum / VehicleMass because the
+    ** binary on/off thruster model combined with the 1 Hz discrete loop produces an
+    ** effective acceleration roughly 0.55× the theoretical value.  The values below
+    ** were derived from flight telemetry: Δv / burn_time for known thruster groups.
+    **
+    ** To recalibrate: run cFS, observe a full-power 0.95 s brake burn in the log,
+    ** read Δv from consecutive cycle speed readings, compute Δv / 0.95.
+    **   Hard  (T08-T15): (0.355 - 0.088) / 0.95 = 0.281 m/s²
+    **   Light (T08-T11): (0.088 - (-0.041)) / 0.95 = 0.136 m/s²
+    ** If thrusterForce or scene geometry changes, re-measure rather than recompute. */
+    .BrakeAccel_Hard_mss  = 0.281f,   /* m/s² — T08-T15, all 8 brake thrusters      */
+    .BrakeAccel_Light_mss = 0.136f,   /* m/s² — T08-T11 only (Brake-Yaw group)      */
+    .ApproachAccel_mss    = 0.163f,   /* m/s² — T04-T07 approach group; from: 0.155 m/s / 0.95 s */
+
+    /* Axial hold-position controller (HOLD phase) — same magnitude as LatKp/
+    ** MaxLatSpeed; gentle enough not to fight the brake burn's own overshoot
+    ** while still walking accumulated range drift back to HoldRange_m. */
+    .AxialHoldKp     = 0.02f,   /* target closing speed = KP × range error (m/s per m) */
+    .MaxHoldSpeed    = 0.05f,   /* cap on hold-correction closing speed (m/s)          */
 };
 
 /*

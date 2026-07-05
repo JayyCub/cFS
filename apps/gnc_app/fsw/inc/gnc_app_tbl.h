@@ -23,7 +23,7 @@
 ** set in the Unity Inspector (RCSModel.thrusterForce and Rigidbody mass).
 ** If they drift, every burn duration will be systematically wrong.
 **
-** Layout: 18 × float = 72 bytes. Naturally 4-byte aligned; no padding required.
+** Layout: 24 × float = 96 bytes. Naturally 4-byte aligned; no padding required.
 */
 typedef struct
 {
@@ -32,7 +32,10 @@ typedef struct
     */
     float AxialKp;          /* target closing speed = KP × range  (m/s per m) */
     float MinCloseSpeed;    /* floor on approach speed             (m/s)        */
-    float MaxCloseSpeed;    /* cap on approach speed               (m/s)        */
+    float MaxCloseSpeed;    /* outer cap on approach speed, before HoldPoint1_m is passed (m/s) */
+    float MaxCloseSpeed_Inner; /* tighter cap once HoldPoint1_m has fired (m/s) — models the
+                                ** real-world profile of a faster outer approach speed and a
+                                ** slower, more cautious speed once inside the first hold point. */
 
     /*
     ** Physical model — must match Unity Inspector values exactly
@@ -98,6 +101,37 @@ typedef struct
     ** through tiny velocity errors instead of chasing them.
     */
     float LatVelDeadband_ms; /* m/s — ignore lateral velocity errors below this */
+
+    /*
+    ** Braking deceleration constants — calibrated to actual Unity thruster geometry.
+    **
+    ** T00-T03 are excluded from docking; T04-T07 are approach-only (+Z).
+    ** The docking brake thrusters are split into two groups:
+    **   Light: T08-T11 (Brake-Yaw group)  — total -Z force ≈ 27.8 N at thrusterForce=10
+    **   Hard:  T08-T15 (both brake groups) — total -Z force ≈ 57.8 N at thrusterForce=10
+    **
+    ** These accel values are used by SelectPhase (brake distance lookahead) and
+    ** ComputeControl (HOLD axial braking).  They must match the Unity sim geometry —
+    ** if thrusterForce or thruster positions change, recalibrate by summing the
+    ** -Z components of the relevant group and dividing by VehicleMass.
+    **
+    ** Unity (RCSModel.SoftBrakeThreshold_N = 938 N) selects group by |Fz|:
+    **   |Fz| < 938 N  →  light brake (T08-T11 only)  [BrakeAccel_Light_mss × mass = 612 N]
+    **   |Fz| ≥ 938 N  →  hard brake  (T08-T15)        [BrakeAccel_Hard_mss  × mass = 1265 N]
+    */
+    float BrakeAccel_Hard_mss;  /* m/s² — deceleration from T08-T15 (hard stop)         */
+    float BrakeAccel_Light_mss; /* m/s² — deceleration from T08-T11 only (soft correct)  */
+    float ApproachAccel_mss;    /* m/s² — actual acceleration from approach group T04-T07  */
+
+    /*
+    ** Axial hold-position controller (HOLD phase only)
+    ** Velocity-only station-keep (target closing speed = 0) cancels drift rate
+    ** but never corrects accumulated range drift once it has occurred. This adds
+    ** proportional position feedback toward the range captured when HOLD was
+    ** entered (GNC_APP_Data.HoldRange_m), identical in structure to LatKp/MaxLatSpeed.
+    */
+    float AxialHoldKp;       /* target closing speed = KP × (Range_m - HoldRange_m) (m/s per m) */
+    float MaxHoldSpeed;      /* cap on hold-correction closing speed                (m/s)        */
 
 } GNC_ParamTbl_t;
 
