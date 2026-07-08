@@ -113,6 +113,18 @@
 */
 #define GNC_CW_MEAN_MOTION  0.00113f  /* rad/s */
 
+#define GNC_DEG2RAD  0.01745329f  /* π / 180 — shared by attitude and corridor-angle math */
+
+/*
+** GNC wakeup period — must match the GNC_APP_SEND_HK_MID (0x1894) entry in
+** sample_defs/tables/sch_lab_table.c. Previously implicitly 1.0s (1 Hz); the
+** CW feedforward in ComputeControl multiplies by this to get a per-cycle
+** delta-v instead of assuming a 1-second cycle, so the two must stay in sync
+** or the feedforward silently over/under-corrects by the ratio between the
+** assumed and actual period.
+*/
+#define GNC_CYCLE_DT_S  0.2f  /* s — 5 Hz */
+
 /*
 ** Event IDs
 */

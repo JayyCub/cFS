@@ -35,9 +35,14 @@ GNC_ParamTbl_t GNC_ParamTbl =
                                    Scale from old: 0.394 × (400/10) × (38/18000) = 0.033
                                    Recalibrate empirically if rotation feels off   */
 
-    /* Burn duration limits */
-    .MinBurnDuration = 0.050f,  /* s — shorter pulses are skipped (coast)        */
-    .MaxBurnDuration = 0.950f,  /* s — cap so burn ends before next 1 Hz tick    */
+    /* Burn duration limits — scaled to the 5 Hz (0.2s) GNC_CYCLE_DT_S cycle.
+       MaxBurnDuration keeps the same ~95% margin the old 1 Hz values had
+       (0.95/1.0); MinBurnDuration is floored at one Unity physics tick
+       (Fixed Timestep = 0.02s) rather than scaled proportionally (0.2×0.05=
+       0.01s), since a shorter request can't resolve to anything finer than
+       one FixedUpdate step anyway. */
+    .MinBurnDuration = 0.020f,  /* s — shorter pulses are skipped (coast)        */
+    .MaxBurnDuration = 0.190f,  /* s — cap so burn ends before next 5 Hz tick    */
 
     /* Lateral position controller */
     .LatKp           = 0.02f,   /* lateral speed = KP × position error           */
@@ -46,14 +51,26 @@ GNC_ParamTbl_t GNC_ParamTbl =
     /* force per cycle, which reduces the axial-coupling drift that was causing   */
     /* the vehicle to recede from the ISS during lateral correction.              */
 
-    /* Phase gate hysteresis pair */
-    .LatApproachGate = 1.00f,   /* m — enter APPROACH when lateral offset < this */
-    .LatCorrectGate  = 1.50f,   /* m — enter CORRECT when lateral offset > this  */
-    /* Increased from 0.5/1.0 — vehicle transitions to APPROACH from 1 m instead
-       of 0.5 m.  In APPROACH the lateral channel switches to velocity-damping only
-       (no position feedback), so the vehicle drifts naturally through the axis.
-       The wider gate means the coasting phase starts sooner and the vehicle has
-       more time to settle before close approach.                                   */
+    /* APPROACH lateral position gain — see doc comment in gnc_app_tbl.h.
+       Both phases now hold the centerline continuously; APPROACH uses a
+       softer gain to keep burns small enough to avoid the lateral/attitude
+       coupling limit cycle under APPROACH's tighter attitude deadband. */
+    .LatKp_Approach    = 0.01f, /* half of LatKp */
+
+    /* Corridor-relative phase gate for the APPROACH -> CORRECT revert only
+       (replaces the old fixed-meter LatCorrectGate — see doc comment in
+       gnc_app_tbl.h). Must track the physical corridor cone (Unity
+       ApproachCorridor.coneHalfAngle) instead of a constant that goes stale
+       as range changes. */
+    .ConeHalfAngle_deg   = 15.0f, /* deg — must match Unity ApproachCorridor.coneHalfAngle   */
+    .MinAllowedLateral_m =  0.15f,/* m — floor so the gate doesn't collapse to 0 near contact */
+    .CorridorMarginOut   =  0.9f, /* revert to CORRECT just inside the actual cone edge       */
+
+    /* CORRECT -> APPROACH entry gate: fixed absolute convergence target,
+       independent of range (replaces the old CorridorMarginIn fraction, which
+       let LAT_CORR hand off to APPROACH 4.46 m off-axis at 33 m range — half
+       the corridor cone there, but nowhere near converged). */
+    .LatEntryThreshold_m = 0.3f,  /* m — LAT_CORR must reach this before entering APPROACH   */
 
     /* Autonomous hold-point waypoints — set to 0.0 to disable */
     .HoldPoint1_m    = 20.0f,   /* m — outer waypoint; GNC pauses here for GO    */
@@ -68,8 +85,29 @@ GNC_ParamTbl_t GNC_ParamTbl =
     /* In APPROACH phase the code tightens this to 0.5× (1.0°) automatically so
        attitude is held more precisely as the vehicle closes on the port.          */
 
-    /* Lateral velocity deadband — prevents bang-bang chatter at small errors     */
-    .LatVelDeadband_ms = 0.015f, /* m/s — coast when velocity error is this small */
+    /* Spin-rate override — see doc comment in gnc_app_tbl.h. Tighter than the
+       old hardcoded 0.01 rad/s: a real drift of ~0.0089 rad/s (a residual rate
+       left over from a prior correction, not an active burn — telemetry showed
+       zero force/torque commanded the entire time) slipped under both that and
+       the angle deadband simultaneously, taking ~10s to accumulate into a ~8°
+       swing before anything corrected it.
+       NOT YET RETUNED: a 2026-07-05 run showed an even slower yaw drift
+       (~0.0025 rad/s, still below this threshold) followed by a large
+       overshoot straight through zero once correction did engage. AngVel_X/Y/Z
+       were added to the wakeup EVS log to get direct rate data before touching
+       this value or the attitude control law further — don't guess-tune this
+       without that telemetry. */
+    .SpinThreshold_rads = 0.003f, /* rad/s — fires correction even inside AttDeadband_deg */
+
+    /* Lateral velocity deadband — see doc comment in gnc_app_tbl.h.
+       Lowered from 0.015 — at LatKp=0.02 that created a ~0.75m dead zone the
+       lateral position controller couldn't correct inside of at all, bigger
+       than LatEntryThreshold_m (0.3m), so LAT_CORR could never actually
+       converge enough to leave. 0.002 keeps the dead zone (~0.1m) safely
+       inside the entry threshold; MinBurnDuration already imposes a similar
+       (~0.0018 m/s) floor on its own, so this isn't giving up much filtering
+       against genuine actuator/noise chatter. */
+    .LatVelDeadband_ms = 0.002f, /* m/s — coast when velocity error is this small */
     /* The limit cycle: lateral burn disturbs roll ~0.5–1°; at AttKp=0.50 that   */
     /* fires a correction every cycle; the correction couples back into lateral.  */
     /* With a 2° deadband, sub-2° perturbations coast rather than being fought.  */

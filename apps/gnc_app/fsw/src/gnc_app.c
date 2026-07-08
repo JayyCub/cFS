@@ -233,14 +233,30 @@ static GNC_Phase_t GNC_APP_SelectPhase(const GNC_APP_UnityTlm_t *tlm, GNC_Phase_
 
     /*
     ** Lateral offset gate with hysteresis.
-    ** LateralOffset_m is the Unity-computed perpendicular distance from the
-    ** docking axis — the most reliable lateral error signal available.
+    **
+    ** Entry (CORRECT -> APPROACH) uses a fixed absolute threshold: initial
+    ** convergence should mean actually near the axis, not just "within some
+    ** fraction of however forgiving the corridor happens to be at this range"
+    ** (a corridor-relative entry gate let LAT_CORR hand off to APPROACH 4.46 m
+    ** off-axis at 33 m range).
+    **
+    ** Revert (APPROACH -> CORRECT) stays corridor-relative: "allowed" is the
+    ** radius of the real docking corridor cone at the current range, so once
+    ** underway, the gate tightens automatically as the vehicle closes in
+    ** instead of using one constant across the whole approach.
     */
-    if (next == GNC_PHASE_CORRECT && tlm->LateralOffset_m < GNC_APP_Data.ParamTblPtr->LatApproachGate)
-        return GNC_PHASE_APPROACH;
+    {
+        const GNC_ParamTbl_t *p = GNC_APP_Data.ParamTblPtr;
 
-    if (next == GNC_PHASE_APPROACH && tlm->LateralOffset_m > GNC_APP_Data.ParamTblPtr->LatCorrectGate)
-        return GNC_PHASE_CORRECT;
+        if (next == GNC_PHASE_CORRECT && tlm->LateralOffset_m < p->LatEntryThreshold_m)
+            return GNC_PHASE_APPROACH;
+
+        float allowed = tlm->Range_m * tanf(p->ConeHalfAngle_deg * GNC_DEG2RAD);
+        if (allowed < p->MinAllowedLateral_m) allowed = p->MinAllowedLateral_m;
+
+        if (next == GNC_PHASE_APPROACH && tlm->LateralOffset_m > allowed * p->CorridorMarginOut)
+            return GNC_PHASE_CORRECT;
+    }
 
     /*
     ** Autonomous hold-point check — fires once per approach sequence when range
@@ -256,9 +272,13 @@ static GNC_Phase_t GNC_APP_SelectPhase(const GNC_APP_UnityTlm_t *tlm, GNC_Phase_
         /* Distance needed to brake to a stop from current closing speed.
         ** BrakeAccel_Hard_mss is the actual deceleration from all 8 brake thrusters
         ** (T08-T15) in Unity — calibrated from thruster geometry, not ThrusterForce.
-        ** The continuous-thrust formula is v²/(2a), but the 1 Hz discrete control
-        ** loop achieves roughly half that in practice (cycle-miss + 0.95s burn cap),
-        ** so empirically v²/a is used. */
+        ** The continuous-thrust formula is v²/(2a); at the old 1 Hz cadence the
+        ** discrete loop only achieved roughly half that in practice (cycle-miss +
+        ** 0.95s burn cap), so empirically v²/a was used instead. That derating was
+        ** calibrated for a 1 Hz cycle — now that GNC_CYCLE_DT_S is 0.2s (5 Hz),
+        ** cycle-miss loss should be much smaller and this formula is likely too
+        ** conservative (braking earlier than necessary). Left as v²/a pending a
+        ** real test run to recalibrate against actual 5 Hz braking distance. */
         float brake_dist = (v * v) / p->BrakeAccel_Hard_mss;
 
         if (GNC_APP_Data.HoldPt1Armed && p->HoldPoint1_m > 0.0f &&
@@ -289,6 +309,74 @@ static GNC_Phase_t GNC_APP_SelectPhase(const GNC_APP_UnityTlm_t *tlm, GNC_Phase_
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 /*                                                                           */
+/* GNC_APP_LateralAxis — position + velocity burn for one lateral axis      */
+/*                                                                           */
+/* Shared by the X and Y channels in GNC_APP_ComputeControl: compute a      */
+/* target velocity from continuous position feedback (gain differs by      */
+/* phase — gentler in APPROACH), then fire a proportional burn to close    */
+/* the velocity error.                                                      */
+/*                                                                           */
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+static void GNC_APP_LateralAxis(float pos, float vel, float ff, GNC_Phase_t phase,
+                                 const GNC_ParamTbl_t *p, float accel,
+                                 float *force, float *max_trans_dur)
+{
+    /* Both phases actively hold the centerline now — APPROACH just uses a
+    ** gentler gain (LatKp_Approach, tuned well below LatKp) so the burns it
+    ** fires are small enough to stay clear of the lateral/attitude coupling
+    ** limit cycle documented on the attitude deadband below, rather than
+    ** disengaging position feedback entirely. */
+    float kp    = (phase == GNC_PHASE_APPROACH) ? p->LatKp_Approach : p->LatKp;
+    float v_tgt = -kp * pos;
+    if (v_tgt >  p->MaxLatSpeed) v_tgt =  p->MaxLatSpeed;
+    if (v_tgt < -p->MaxLatSpeed) v_tgt = -p->MaxLatSpeed;
+
+    float v_err = v_tgt - vel + ff;
+    float db    = p->LatVelDeadband_ms;   /* m/s — coasting threshold */
+    if (v_err > db)
+    {
+        float dur = (v_err - db) / accel;
+        if (dur >= p->MinBurnDuration) { *force += p->ThrusterForce; if (dur > *max_trans_dur) *max_trans_dur = dur; }
+    }
+    else if (v_err < -db)
+    {
+        float dur = (-v_err - db) / accel;
+        if (dur >= p->MinBurnDuration) { *force -= p->ThrusterForce; if (dur > *max_trans_dur) *max_trans_dur = dur; }
+    }
+}
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+/*                                                                           */
+/* GNC_APP_AttitudeAxis — PD burn for one attitude axis (pitch/yaw/roll)    */
+/*                                                                           */
+/* Shared by the three Channel 3 axes: target rate = AttKp × error (rad),  */
+/* rate error drives the burn duration.  kT is passed in rather than       */
+/* recomputed per axis (it's the same for all three).                     */
+/*                                                                           */
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+static void GNC_APP_AttitudeAxis(float err_deg, float angvel, const GNC_ParamTbl_t *p,
+                                  float kT, float *torque, float *max_att_dur)
+{
+    const float d2r       = 0.01745329f;  /* π / 180 */
+    float       omega_tgt = p->AttKp * (err_deg * d2r);
+    if (omega_tgt >  p->MaxAttRate) omega_tgt =  p->MaxAttRate;
+    if (omega_tgt < -p->MaxAttRate) omega_tgt = -p->MaxAttRate;
+
+    float omega_err = omega_tgt - angvel;
+    if (omega_err > 0.0f)
+    {
+        float dur = omega_err / p->RotAccel;
+        if (dur >= p->MinBurnDuration) { *torque += kT; if (dur > *max_att_dur) *max_att_dur = dur; }
+    }
+    else if (omega_err < 0.0f)
+    {
+        float dur = -omega_err / p->RotAccel;
+        if (dur >= p->MinBurnDuration) { *torque -= kT; if (dur > *max_att_dur) *max_att_dur = dur; }
+    }
+}
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+/*                                                                           */
 /* GNC_APP_ComputeControl — phase-dispatched proportional guidance          */
 /*                                                                           */
 /* Three independent channels; behaviour changes with phase:                 */
@@ -313,7 +401,7 @@ static GNC_Phase_t GNC_APP_SelectPhase(const GNC_APP_UnityTlm_t *tlm, GNC_Phase_
 /*                                                                           */
 /* Duration is the maximum across all active channels so the dominant        */
 /* correction is exact; shorter-needed axes are slightly over-fired but self-*/
-/* correct within the next 1 Hz cycle (same behaviour as real bang-coast-    */
+/* correct within the next wakeup cycle (same behaviour as real bang-coast-  */
 /* bang proximity ops with finite-duration pulses).                          */
 /*                                                                           */
 /* Reads only from the caller's local copy of tlm — no shared state.        */
@@ -344,16 +432,20 @@ static GNC_Control_t GNC_APP_ComputeControl(const GNC_APP_UnityTlm_t *tlm, GNC_P
     /* Y=along-track, Z=approach/cross-track).  Folding the equal-and-    */
     /* opposite delta-v into each channel's velocity error pre-cancels    */
     /* the drift without extra logic — the existing burn computation       */
-    /* absorbs it automatically.  dt = 1 s (1 Hz cycle).                 */
-    /*   CW: ax =  3n²rx + 2n·vy  →  ff_x = -(ax)                       */
-    /*       ay = -2n·vx          →  ff_y = -(ay) = +2n·vx              */
-    /*       az = -n²rz           →  ff_z = -(az) = +n²rz               */
+    /* absorbs it automatically.  ax/ay/az are accelerations (m/s²); the   */
+    /* ×GNC_CYCLE_DT_S converts each to the delta-v accumulated over one   */
+    /* wakeup period, so the feedforward stays correct if the cycle rate   */
+    /* changes (it does NOT assume a 1-second cycle the way the raw accel  */
+    /* values would).                                                       */
+    /*   CW: ax =  3n²rx + 2n·vy  →  ff_x = -(ax) × dt                    */
+    /*       ay = -2n·vx          →  ff_y = -(ay) × dt = +2n·vx × dt      */
+    /*       az = -n²rz           →  ff_z = -(az) × dt = +n²rz × dt       */
     {
         const float n  = GNC_CW_MEAN_MOTION;
         const float n2 = n * n;
-        ff_x = -(3.0f * n2 * tlm->Pos_X + 2.0f * n * tlm->Vel_Y);
-        ff_y =   2.0f * n  * tlm->Vel_X;
-        ff_z =   n2         * tlm->Pos_Z;
+        ff_x = -(3.0f * n2 * tlm->Pos_X + 2.0f * n * tlm->Vel_Y) * GNC_CYCLE_DT_S;
+        ff_y =   2.0f * n  * tlm->Vel_X                          * GNC_CYCLE_DT_S;
+        ff_z =   n2         * tlm->Pos_Z                          * GNC_CYCLE_DT_S;
     }
 
     /* === Channel 1 — Axial =========================================== */
@@ -415,88 +507,23 @@ static GNC_Control_t GNC_APP_ComputeControl(const GNC_APP_UnityTlm_t *tlm, GNC_P
 
     /* === Channel 2 — Lateral position + velocity (X and Y) =========== */
     /*                                                                    */
-    /* LAT_CORR phase: position + velocity feedback.                     */
-    /*   Target velocity = clamp(-LatKp × Pos_XY, ±MaxLatSpeed)         */
+    /* Both phases hold the centerline continuously via position +      */
+    /* velocity feedback:                                                */
+    /*   Target velocity = clamp(-Kp × Pos_XY, ±MaxLatSpeed)            */
     /*   Velocity error drives the burn duration.                        */
-    /*                                                                    */
-    /* APPROACH phase: velocity-damp only (no position feedback).        */
-    /*   Target velocity = 0 — null out any residual lateral velocity.  */
-    /*   Once the vehicle is near the axis it drifts through naturally   */
-    /*   without being pulled back and forth by a position P-term.       */
+    /* Kp is LatKp in CORRECT, LatKp_Approach (deliberately gentler) in  */
+    /* APPROACH — see GNC_APP_LateralAxis for why: the tighter APPROACH  */
+    /* attitude deadband below has less headroom to absorb the attitude  */
+    /* disturbance each lateral burn causes, so APPROACH corrects with   */
+    /* smaller, more frequent nudges rather than CORRECT's stronger gain.*/
     /*                                                                    */
     /* Velocity deadband: skip the burn when the velocity error is small */
     /* enough that the minimum 400 N impulse would overshoot.  Without   */
     /* this, the controller alternates ±400 N every cycle (bang-bang     */
     /* chatter) whenever it is near the target velocity.                 */
     {
-        float db = p->LatVelDeadband_ms;   /* m/s — coasting threshold */
-
-        /* X axis */
-        float v_lat_tgt_X;
-        if (phase == GNC_PHASE_APPROACH)
-        {
-            v_lat_tgt_X = 0.0f;           /* damp lateral velocity, don't position-correct */
-        }
-        else
-        {
-            v_lat_tgt_X = -p->LatKp * tlm->Pos_X;
-            if (v_lat_tgt_X >  p->MaxLatSpeed) v_lat_tgt_X =  p->MaxLatSpeed;
-            if (v_lat_tgt_X < -p->MaxLatSpeed) v_lat_tgt_X = -p->MaxLatSpeed;
-        }
-
-        float v_lat_err_X = v_lat_tgt_X - tlm->Vel_X + ff_x;
-        if (v_lat_err_X > db)
-        {
-            dur = (v_lat_err_X - db) / accel;
-            if (dur >= p->MinBurnDuration) { ctrl.Fx += kF; if (dur > max_trans_dur) max_trans_dur = dur; }
-        }
-        else if (v_lat_err_X < -db)
-        {
-            dur = (-v_lat_err_X - db) / accel;
-            if (dur >= p->MinBurnDuration) { ctrl.Fx -= kF; if (dur > max_trans_dur) max_trans_dur = dur; }
-        }
-
-        /* Y axis */
-        float v_lat_tgt_Y;
-        if (phase == GNC_PHASE_APPROACH)
-        {
-            v_lat_tgt_Y = 0.0f;
-        }
-        else
-        {
-            v_lat_tgt_Y = -p->LatKp * tlm->Pos_Y;
-            if (v_lat_tgt_Y >  p->MaxLatSpeed) v_lat_tgt_Y =  p->MaxLatSpeed;
-            if (v_lat_tgt_Y < -p->MaxLatSpeed) v_lat_tgt_Y = -p->MaxLatSpeed;
-        }
-
-        float v_lat_err_Y = v_lat_tgt_Y - tlm->Vel_Y + ff_y;
-        if (v_lat_err_Y > db)
-        {
-            dur = (v_lat_err_Y - db) / accel;
-            if (dur >= p->MinBurnDuration) { ctrl.Fy += kF; if (dur > max_trans_dur) max_trans_dur = dur; }
-        }
-        else if (v_lat_err_Y < -db)
-        {
-            dur = (-v_lat_err_Y - db) / accel;
-            if (dur >= p->MinBurnDuration) { ctrl.Fy -= kF; if (dur > max_trans_dur) max_trans_dur = dur; }
-        }
-    }
-
-    /* === Lateral-coupling +Fz feed-forward (LAT_CORR only) ============== */
-    /*                                                                        */
-    /* When actively translating in LAT_CORR, the lateral burn disturbs       */
-    /* attitude; the resulting T08-T15 corrections produce coupled −Z that    */
-    /* drives the vehicle backward faster than Channel 1 can react.           */
-    /* Add proactive +Fz proportional to the lateral force so forward thrust  */
-    /* fires in the same burst as the lateral correction rather than 1 cycle  */
-    /* later.  Coefficient 0.4: empirical — T08-T15 are ~1.7× stronger in    */
-    /* the −Z direction than T04-T07 are in +Z, so even partial compensation  */
-    /* combined with the wider deadband above keeps range stable.             */
-    if (phase == GNC_PHASE_CORRECT)
-    {
-        float lat_mag = fabsf(ctrl.Fx) + fabsf(ctrl.Fy);
-        if (lat_mag > 0.5f)
-            ctrl.Fz += 0.4f * lat_mag;
+        GNC_APP_LateralAxis(tlm->Pos_X, tlm->Vel_X, ff_x, phase, p, accel, &ctrl.Fx, &max_trans_dur);
+        GNC_APP_LateralAxis(tlm->Pos_Y, tlm->Vel_Y, ff_y, phase, p, accel, &ctrl.Fy, &max_trans_dur);
     }
 
     /* === Channel 3 — Attitude PD (all active phases) =================== */
@@ -508,16 +535,23 @@ static GNC_Control_t GNC_APP_ComputeControl(const GNC_APP_UnityTlm_t *tlm, GNC_P
     /*   duration  = |omega_err| / RotAccel                                 */
     /*                                                                      */
     /* Deadband: attitude corrections are skipped when all three errors are */
-    /* below AttDeadband_deg AND the vehicle is not spinning fast (>0.01   */
-    /* rad/s on any axis).  This breaks the lateral↔attitude limit cycle:  */
-    /* lateral burns disturb attitude ~0.5–1°; without a deadband the      */
-    /* controller fires corrective burns every Hz cycle, and those burns    */
-    /* couple back into lateral and roll, sustaining the oscillation.      */
+    /* below AttDeadband_deg AND the vehicle is not spinning faster than    */
+    /* SpinThreshold_rads on any axis.  The angle deadband breaks the       */
+    /* lateral↔attitude limit cycle: lateral burns disturb attitude ~0.5–1°;*/
+    /* without it the controller fires corrective burns every cycle, and    */
+    /* those burns couple back into lateral and roll, sustaining the        */
+    /* oscillation. The separate, much tighter spin check exists because    */
+    /* the angle deadband alone lets a small *sustained* residual rate      */
+    /* (e.g. left over from an earlier correction's overshoot, not an       */
+    /* active burn) silently accumulate into a large angle error over many  */
+    /* seconds before the angle ever crosses the deadband edge. With angle  */
+    /* error near zero, AttitudeAxis's own omega_tgt = AttKp × error comes  */
+    /* out near zero too, so this override's correction is naturally a      */
+    /* small rate-damping nudge, not a large shove — it doesn't reintroduce */
+    /* the angle deadband's chatter problem, it just stops residual spin    */
+    /* from going uncorrected indefinitely.                                 */
     {
-        const float kp    = p->AttKp;
-        const float max_w = p->MaxAttRate;
-        const float d2r   = 0.01745329f;  /* π / 180 */
-        float       omega_tgt, omega_err;
+        const float d2r = 0.01745329f;  /* π / 180 */
 
         /* Attitude deadband by phase:
         **   LAT_CORR  2× (4°): lateral burns disturb attitude ~0.5-2°; a wider
@@ -530,9 +564,10 @@ static GNC_Control_t GNC_APP_ComputeControl(const GNC_APP_UnityTlm_t *tlm, GNC_P
         else if (phase == GNC_PHASE_CORRECT)  att_db_deg = p->AttDeadband_deg * 2.0f;
         else                                   att_db_deg = p->AttDeadband_deg;
         float       db_rad   = att_db_deg * d2r;
-        bool        spinning = (tlm->AngVel_X >  0.01f || tlm->AngVel_X < -0.01f ||
-                                tlm->AngVel_Y >  0.01f || tlm->AngVel_Y < -0.01f ||
-                                tlm->AngVel_Z >  0.01f || tlm->AngVel_Z < -0.01f);
+        float       spin_th  = p->SpinThreshold_rads;
+        bool        spinning = (tlm->AngVel_X >  spin_th || tlm->AngVel_X < -spin_th ||
+                                tlm->AngVel_Y >  spin_th || tlm->AngVel_Y < -spin_th ||
+                                tlm->AngVel_Z >  spin_th || tlm->AngVel_Z < -spin_th);
         bool        in_db    = (db_rad > 0.0f &&
                                 tlm->PitchError_deg * d2r >  -db_rad &&
                                 tlm->PitchError_deg * d2r <   db_rad &&
@@ -543,53 +578,9 @@ static GNC_Control_t GNC_APP_ComputeControl(const GNC_APP_UnityTlm_t *tlm, GNC_P
         /* Skip attitude correction only when all errors are small AND not spinning */
         if (in_db && !spinning) goto attitude_done;
 
-        /* Pitch — X axis */
-        omega_tgt = kp * (tlm->PitchError_deg * d2r);
-        if (omega_tgt >  max_w) omega_tgt =  max_w;
-        if (omega_tgt < -max_w) omega_tgt = -max_w;
-        omega_err = omega_tgt - tlm->AngVel_X;
-        if (omega_err > 0.0f)
-        {
-            dur = omega_err / p->RotAccel;
-            if (dur >= p->MinBurnDuration) { ctrl.Tx += kT; if (dur > max_att_dur) max_att_dur = dur; }
-        }
-        else if (omega_err < 0.0f)
-        {
-            dur = -omega_err / p->RotAccel;
-            if (dur >= p->MinBurnDuration) { ctrl.Tx -= kT; if (dur > max_att_dur) max_att_dur = dur; }
-        }
-
-        /* Yaw — Y axis */
-        omega_tgt = kp * (tlm->YawError_deg * d2r);
-        if (omega_tgt >  max_w) omega_tgt =  max_w;
-        if (omega_tgt < -max_w) omega_tgt = -max_w;
-        omega_err = omega_tgt - tlm->AngVel_Y;
-        if (omega_err > 0.0f)
-        {
-            dur = omega_err / p->RotAccel;
-            if (dur >= p->MinBurnDuration) { ctrl.Ty += kT; if (dur > max_att_dur) max_att_dur = dur; }
-        }
-        else if (omega_err < 0.0f)
-        {
-            dur = -omega_err / p->RotAccel;
-            if (dur >= p->MinBurnDuration) { ctrl.Ty -= kT; if (dur > max_att_dur) max_att_dur = dur; }
-        }
-
-        /* Roll — Z axis */
-        omega_tgt = kp * (tlm->RollError_deg * d2r);
-        if (omega_tgt >  max_w) omega_tgt =  max_w;
-        if (omega_tgt < -max_w) omega_tgt = -max_w;
-        omega_err = omega_tgt - tlm->AngVel_Z;
-        if (omega_err > 0.0f)
-        {
-            dur = omega_err / p->RotAccel;
-            if (dur >= p->MinBurnDuration) { ctrl.Tz += kT; if (dur > max_att_dur) max_att_dur = dur; }
-        }
-        else if (omega_err < 0.0f)
-        {
-            dur = -omega_err / p->RotAccel;
-            if (dur >= p->MinBurnDuration) { ctrl.Tz -= kT; if (dur > max_att_dur) max_att_dur = dur; }
-        }
+        GNC_APP_AttitudeAxis(tlm->PitchError_deg, tlm->AngVel_X, p, kT, &ctrl.Tx, &max_att_dur);
+        GNC_APP_AttitudeAxis(tlm->YawError_deg,   tlm->AngVel_Y, p, kT, &ctrl.Ty, &max_att_dur);
+        GNC_APP_AttitudeAxis(tlm->RollError_deg,  tlm->AngVel_Z, p, kT, &ctrl.Tz, &max_att_dur);
     }
     attitude_done:;
 
@@ -626,13 +617,44 @@ static GNC_Control_t GNC_APP_ComputeControl(const GNC_APP_UnityTlm_t *tlm, GNC_P
         }
     }
 
+    /* === Lateral/attitude-coupling +Fz feed-forward (LAT_CORR only) ====== */
+    /*                                                                        */
+    /* When actively translating or re-orienting in LAT_CORR, the lateral    */
+    /* and attitude burns disturb the vehicle; the resulting T08-T15         */
+    /* corrections produce coupled −Z that drives the vehicle backward       */
+    /* faster than Channel 1 can react.  Add proactive +Fz proportional to   */
+    /* the coupling-causing commands so forward thrust fires in the same     */
+    /* burst rather than 1 cycle later.                                      */
+    /*                                                                        */
+    /* Computed here, after duration scaling, so it reacts to the wrench      */
+    /* actually sent to Unity this cycle rather than the pre-scale Channel 2  */
+    /* values — the original version only ever saw Fx/Fy because it ran      */
+    /* before Channel 3 had set Tx/Ty/Tz, silently missing the attitude half  */
+    /* of the coupling whenever a large attitude error was also being        */
+    /* corrected (as it commonly is on LAT_CORR entry).                       */
+    /*                                                                        */
+    /* Torque is converted back to a force-equivalent (÷ moment arm) so it    */
+    /* combines with the lateral force magnitude on the same footing before   */
+    /* coefficient 0.4 is applied. That coefficient is still the same rough   */
+    /* empirical estimate as before (T08-T15 ≈1.7× stronger in −Z than       */
+    /* T04-T07 are in +Z) — re-tune against telemetry if range still drifts   */
+    /* during LAT_CORR.                                                       */
+    if (phase == GNC_PHASE_CORRECT)
+    {
+        float lat_mag      = fabsf(ctrl.Fx) + fabsf(ctrl.Fy);
+        float att_mag      = (fabsf(ctrl.Tx) + fabsf(ctrl.Ty) + fabsf(ctrl.Tz)) / GNC_RCS_MOMENT_ARM;
+        float coupling_mag = lat_mag + att_mag;
+        if (coupling_mag > 0.5f)
+            ctrl.Fz += 0.4f * coupling_mag;
+    }
+
     ctrl.duration_s = max_dur;
     return ctrl;
 }
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 /*                                                                           */
-/* GNC_APP_ProcessWakeup — called at 1 Hz by SCH_LAB                        */
+/* GNC_APP_ProcessWakeup — called every GNC_CYCLE_DT_S by SCH_LAB (5 Hz)    */
 /*                                                                           */
 /* 1. Snapshot the latest Unity telemetry under the mutex.                  */
 /* 2. Run the phase state machine to determine the active GNC mode.         */
@@ -732,10 +754,15 @@ void GNC_APP_ProcessWakeup(void)
         int inCorridor = (tlm.Flags & 0x1) != 0;
         int docked     = (tlm.Flags & 0x2) != 0;
 
+        /* Compact format — the previous version regularly exceeded
+        ** CFE_MISSION_EVS_MAX_MESSAGE_LENGTH (122) and got silently truncated
+        ** mid-field. PYR = pitch/yaw/roll error (deg); W = AngVel_X/Y/Z
+        ** (rad/s), added to actually see attitude rate instead of inferring it
+        ** from how PYR changes cycle to cycle; C/D = InCorridor/Docked flags. */
         CFE_EVS_SendEvent(GNC_APP_WAKEUP_INF_EID, CFE_EVS_EventType_INFORMATION,
-                          "GNC #%u [%s] | Rng=%.2f Spd=%.3f Lat=%.3f | "
-                          "P=%.1f Y=%.1f R=%.1f | "
-                          "Cor=%d Dkd=%d | F=(%.0f,%.0f,%.0f) T=(%.0f,%.0f,%.0f) Dur=%.3fs",
+                          "GNC #%u [%s] Rng=%.2f Spd=%.3f Lat=%.3f "
+                          "PYR=%.1f/%.1f/%.1f W=%.3f/%.3f/%.3f C%dD%d "
+                          "F=%.0f/%.0f/%.0f T=%.0f/%.0f/%.0f D=%.2f",
                           (unsigned int)GNC_APP_Data.HkTlm.WakeupCount,
                           PHASE_NAMES[GNC_APP_Data.Phase],
                           (double)tlm.Range_m,
@@ -744,6 +771,9 @@ void GNC_APP_ProcessWakeup(void)
                           (double)tlm.PitchError_deg,
                           (double)tlm.YawError_deg,
                           (double)tlm.RollError_deg,
+                          (double)tlm.AngVel_X,
+                          (double)tlm.AngVel_Y,
+                          (double)tlm.AngVel_Z,
                           inCorridor, docked,
                           (double)ctrl.Fx, (double)ctrl.Fy, (double)ctrl.Fz,
                           (double)ctrl.Tx, (double)ctrl.Ty, (double)ctrl.Tz,

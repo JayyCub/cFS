@@ -23,7 +23,7 @@
 ** set in the Unity Inspector (RCSModel.thrusterForce and Rigidbody mass).
 ** If they drift, every burn duration will be systematically wrong.
 **
-** Layout: 24 × float = 96 bytes. Naturally 4-byte aligned; no padding required.
+** Layout: 28 × float = 112 bytes. Naturally 4-byte aligned; no padding required.
 */
 typedef struct
 {
@@ -48,7 +48,7 @@ typedef struct
     ** Burn duration limits
     */
     float MinBurnDuration;  /* s — pulses shorter than this coast (dead-band)   */
-    float MaxBurnDuration;  /* s — cap so thruster stops before next 1 Hz tick  */
+    float MaxBurnDuration;  /* s — cap so thruster stops before next GNC wakeup */
 
     /*
     ** Lateral position controller
@@ -57,10 +57,51 @@ typedef struct
     float MaxLatSpeed;      /* lateral speed cap                   (m/s)        */
 
     /*
-    ** Phase gate hysteresis pair (LateralOffset_m thresholds)
+    ** APPROACH lateral position gain.
+    **
+    ** APPROACH holds the centerline continuously, same as CORRECT, but with a
+    ** gentler gain. The attitude deadband tightens to 0.5× in APPROACH (nose-
+    ** on-port precision), leaving less headroom to absorb the attitude
+    ** disturbance each lateral burn causes before it trips a correction and
+    ** couples back into lateral (the limit cycle documented on AttDeadband_deg
+    ** below). A softer gain means smaller, more frequent corrective nudges
+    ** instead of CORRECT's stronger pull — still always tracking the axis,
+    ** just less likely to kick off that coupling.
     */
-    float LatApproachGate;  /* m — enter APPROACH when lateral offset < this   */
-    float LatCorrectGate;   /* m — enter LATERAL_CORRECT when offset > this    */
+    float LatKp_Approach;    /* lateral speed = KP × position error (m/s per m),
+                              ** used in place of LatKp during APPROACH           */
+
+    /*
+    ** Corridor-relative phase gate (APPROACH → CORRECT revert only).
+    **
+    ** The physical docking corridor (Unity ApproachCorridor.cs) is a cone of
+    ** half-angle ConeHalfAngle_deg from the target port, so the *absolute*
+    ** lateral offset it tolerates shrinks with range: allowed_m = Range_m *
+    ** tan(ConeHalfAngle_deg). A fixed-meter gate doesn't scale with that — a
+    ** threshold loose enough to avoid nuisance re-entries at long range becomes
+    ** far looser than the real corridor at short range. That mismatch is what
+    ** let the vehicle drift to 0.86 m off-axis while still reading as "inside
+    ** the gate" at a fixed 1.5 m threshold.
+    **
+    ** ConeHalfAngle_deg must match Unity's ApproachCorridor.coneHalfAngle.
+    **
+    ** This pair only governs the *revert* to CORRECT once APPROACH is already
+    ** underway — the physical corridor is the right reference for "has this
+    ** gotten dangerously off-axis for the current range." The CORRECT → APPROACH
+    ** *entry* gate is LatEntryThreshold_m below instead: a fixed absolute value,
+    ** because "is initial convergence good enough to commit to closure" is a
+    ** mission-precision choice, not a function of how forgiving the corridor
+    ** happens to be at long range (a corridor-relative entry gate let LAT_CORR
+    ** hand off to APPROACH 4.46 m off-axis at 33 m range — technically inside
+    ** half the cone, but nowhere near "converged").
+    */
+    float ConeHalfAngle_deg;   /* deg — must match Unity ApproachCorridor.coneHalfAngle        */
+    float MinAllowedLateral_m; /* m — floor on the corridor radius so the gate doesn't vanish
+                                ** to zero right at the port                                   */
+    float LatEntryThreshold_m; /* m — fixed absolute offset LAT_CORR must converge to before
+                                ** entering APPROACH, independent of range                     */
+    float CorridorMarginOut;   /* fraction (0-1) of corridor radius — revert to CORRECT once
+                                ** offset exceeds this fraction                                */
 
     /*
     ** Autonomous hold-point waypoints (range thresholds, approach axis).
@@ -84,21 +125,52 @@ typedef struct
     ** Attitude deadband
     ** Attitude corrections are suppressed on all axes when ALL three errors
     ** (pitch, yaw, roll) are within this threshold in degrees AND the vehicle
-    ** is not spinning fast.  This breaks the limit cycle caused by lateral
-    ** correction burns disturbing attitude, which then triggers corrective burns
-    ** that themselves couple back into lateral — the core feedback loop.
-    ** Set to 0.0 to disable (always correct attitude, old behaviour).
+    ** is not spinning fast (SpinThreshold_rads below).  This breaks the limit
+    ** cycle caused by lateral correction burns disturbing attitude, which then
+    ** triggers corrective burns that themselves couple back into lateral — the
+    ** core feedback loop.  Set to 0.0 to disable (always correct attitude, old
+    ** behaviour).
     */
     float AttDeadband_deg;  /* deg — skip attitude correction below this error  */
 
     /*
+    ** Spin-rate override.
+    **
+    ** Even inside AttDeadband_deg, a nonzero angular rate this small or larger
+    ** still fires a correction — otherwise a small *sustained* residual rate
+    ** (e.g. left over from an earlier correction's overshoot) can silently
+    ** accumulate into a large angle error over many seconds before the angle
+    ** deadband itself ever notices. Deliberately tighter than it looks: with
+    ** angle error near zero (that's the only time this override matters — a
+    ** large angle error already fires unconditionally), AttitudeAxis's own
+    ** omega_tgt = AttKp × error comes out near zero too, so the resulting
+    ** correction is naturally a small rate-damping nudge, not a large shove —
+    ** this does not reintroduce the angle-deadband's chatter problem, it only
+    ** catches drift the angle deadband was never meant to allow indefinitely.
+    */
+    float SpinThreshold_rads; /* rad/s — fires correction even inside AttDeadband_deg
+                               ** once |AngVel| on any axis reaches this              */
+
+    /*
     ** Lateral velocity deadband
     ** Only fire a lateral correction burn when the velocity error exceeds this
-    ** threshold.  Without it, 400 N thrusters at 1 Hz create a bang-bang
-    ** limit cycle: each impulse overshoots the target lateral velocity, the
-    ** next cycle fires the opposite direction, and so on — visible as F_x
-    ** alternating sign every cycle.  A small deadband lets the vehicle coast
-    ** through tiny velocity errors instead of chasing them.
+    ** threshold.  Without it, 400 N thrusters create a bang-bang limit cycle:
+    ** each impulse overshoots the target lateral velocity, the next cycle
+    ** fires the opposite direction, and so on — visible as F_x alternating
+    ** sign every cycle.  A small deadband lets the vehicle coast through tiny
+    ** velocity errors instead of chasing them.
+    **
+    ** MUST stay well below LatKp × (smallest lateral offset still worth
+    ** actively correcting) — GNC_APP_LateralAxis's target velocity is
+    ** v_tgt = -LatKp × pos, so if this deadband exceeds that product the
+    ** controller never clears it and does nothing at all below
+    ** pos = LatVelDeadband_ms / LatKp. At the old 0.015, that floor was
+    ** 0.015/0.02 = 0.75 m — larger than LatEntryThreshold_m (0.3 m), so
+    ** LAT_CORR could get stuck orbiting the edge of that dead zone forever,
+    ** never converging enough to hand off to APPROACH (confirmed in
+    ** telemetry: F=(0,0,0) for 80+ consecutive cycles while Lat climbed
+    ** freely from 0.67 m to 0.85 m). Lowered so the dead zone (now ~0.1 m)
+    ** sits safely inside the entry threshold instead of outside it.
     */
     float LatVelDeadband_ms; /* m/s — ignore lateral velocity errors below this */
 
