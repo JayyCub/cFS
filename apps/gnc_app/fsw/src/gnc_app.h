@@ -150,6 +150,10 @@
 #define GNC_APP_TBL_ERR_EID       20  /* parameter table load or access error       */
 #define GNC_APP_HOLDPT1_INF_EID   21  /* autonomous hold point 1 reached            */
 #define GNC_APP_HOLDPT2_INF_EID   22  /* autonomous hold point 2 reached            */
+#define GNC_APP_TBL_VAL_ERR_EID   23  /* parameter table failed load-time validation */
+#define GNC_APP_BAD_CTRL_EID      24  /* non-finite control output sanitized to coast */
+#define GNC_APP_TLM_LOSS_EID      25  /* telemetry loss exceeded timeout — auto-abort */
+#define GNC_APP_ANOMALY_EID       26  /* actuator authority anomaly (commanded burn underdelivering) */
 
 /*
 ** Ground command function codes
@@ -165,6 +169,13 @@
 #define GNC_APP_HOLD_CC            2
 #define GNC_APP_GO_CC              3
 #define GNC_APP_ABORT_CC           4
+
+/*
+** CFE_TBL validator return code — GNC_APP_ValidateParamTbl returns this (rather
+** than CFE_SUCCESS) when a loaded table image fails a sanity check, so
+** CFE_TBL_Load/Manage rejects it and keeps running on the last-known-good table.
+*/
+#define GNC_APP_TBL_VALIDATE_ERR (0xc0000010)
 
 /*
 ** Ground command message structures.
@@ -208,7 +219,7 @@ typedef enum
 
 /*
 ** Unity telemetry packet — must match UdpTelemetrySender.cs BuildPacket() exactly.
-** 17 floats (68 bytes) + 1 int32 (4 bytes) = 72 bytes, little-endian.
+** 19 floats (76 bytes) + 1 int32 (4 bytes) = 80 bytes, little-endian.
 ** __attribute__((packed)) prevents compiler from inserting any padding.
 */
 typedef struct __attribute__((packed))
@@ -218,7 +229,9 @@ typedef struct __attribute__((packed))
     float ClosingSpeed_ms;
     float LateralOffset_m;
     float AttitudeError_deg;
-    float Pos_X;
+    float Pos_X;             /* chaser transform origin, world frame — CW feedforward
+                              ** input only. NOT docking-port-relative; do not use this
+                              ** for lateral control, see LatOffset_X/Y below.          */
     float Pos_Y;
     float Pos_Z;
     float Vel_X;
@@ -231,6 +244,14 @@ typedef struct __attribute__((packed))
     float PitchError_deg;   /* per-axis attitude errors [-180, 180]; 0 = aligned */
     float YawError_deg;
     float RollError_deg;
+    float LatOffset_X;      /* docking-port-relative lateral offset, signed, in the
+                             ** target port's local right/up frame (meters) — what the
+                             ** lateral controller actually steers on. Unlike Pos_X/Y,
+                             ** this tracks the docking PORT (chaserPort), not the
+                             ** chaser's transform origin, so attitude changes that sweep
+                             ** the port sideways (moment arm from origin to port) are
+                             ** visible here even when the origin itself isn't moving. */
+    float LatOffset_Y;
 } GNC_APP_UnityTlm_t;
 
 /*
@@ -252,7 +273,20 @@ typedef struct
     /* Phase 5D — LC watchpoint fields (offsets 32, 36, 40) */
     float                     ClosingSpeed_ms;   /* latest Unity closing speed; mirrored for LC overspeed WP */
     float                     LateralOffset_m;   /* latest Unity lateral offset; mirrored for LC corridor WP */
-    uint32                    TlmStaleSec;       /* seconds since last fresh Unity packet; LC telemetry-loss WP */
+    uint32                    TlmStaleSec;       /* consecutive stale wakeup cycles since last fresh Unity
+                                                  ** packet (despite the name, units are wakeup cycles, not
+                                                  ** literal seconds — multiply by GNC_CYCLE_DT_S). Drives the
+                                                  ** auto-abort watchdog in GNC_APP_ProcessWakeup since no LC
+                                                  ** instance is started for this target (see targets.cmake). */
+    uint32                    ActuatorAnomalyCount; /* times the axial actuator-health monitor flagged a
+                                                     ** commanded burn as significantly underdelivering        */
+    /* Attitude — previously visible only in the (often line-truncated) EVS
+    ** wakeup log text, not as an actual telemetry point a ground tool could
+    ** trend or alarm on. Mirrors the latest Unity telemetry each wakeup cycle,
+    ** same pattern as ClosingSpeed_ms/LateralOffset_m above. */
+    float                     PitchError_deg;
+    float                     YawError_deg;
+    float                     RollError_deg;
 } GNC_APP_HkTlm_t;
 
 /*
@@ -270,6 +304,22 @@ typedef struct
     bool               HoldPt1Armed; /* true until hold point 1 fires; re-armed by ABORT+GO */
     bool               HoldPt2Armed; /* true until hold point 2 fires; re-armed by ABORT+GO */
     float              HoldRange_m;  /* Range_m captured at HOLD entry; axial position target */
+    uint32             SettleCounter; /* consecutive cycles the CORRECT->APPROACH settle gate
+                                       ** (position + velocity + attitude rate) has held; reset
+                                       ** to 0 on any cycle where a condition fails */
+    bool               BadCtrlLatched; /* true while the last ComputeControl output was non-finite;
+                                        ** suppresses repeat GNC_APP_BAD_CTRL_EID events for the same episode */
+
+    /* Axial actuator-health monitor (Phase 2) — compares the previous cycle's
+    ** commanded axial burn against the closing-speed change actually observed
+    ** this cycle, to catch a thruster-delivery regression (like the allocator
+    ** under-delivery bug) automatically instead of relying on someone reading
+    ** the EVS log. Observational only — see GNC_APP_CheckActuatorHealth. */
+    float              PrevCtrlFz;          /* previous cycle's commanded axial force (N)        */
+    float              PrevCtrlDuration_s;  /* previous cycle's burn duration (s); 0 = nothing to check */
+    float              PrevClosingSpeed_ms; /* ClosingSpeed_ms at the time PrevCtrlFz was computed */
+    uint32             UnderDeliveryStreak; /* consecutive cycles where the observed axial Δv came in
+                                             ** well under what PrevCtrlFz/PrevCtrlDuration_s predicted */
 
     /* UDP receive thread and shared telemetry state */
     osal_id_t          UdpTaskId;

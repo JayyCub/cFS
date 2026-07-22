@@ -27,13 +27,21 @@ GNC_ParamTbl_t GNC_ParamTbl =
     /* Mirrors observed SpaceX Dragon docking profile: ~0.3 m/s outside the first
        hold point, dropping to ~0.1 m/s once past it and re-commanded to GO.      */
 
-    /* Physical model — must match Unity Inspector */
+    /* Physical model — must match Unity Inspector; see "Key Coupling
+       Constraints" in Docs/DEV_REFERENCE.md for the full list and both
+       locations that must stay in sync. */
     .ThrusterForce   = 400.0f,  /* N per thruster — real Draco thruster          */
-    .VehicleMass     = 4500.0f, /* kg — Dragon 2 capsule + trunk + crew          */
-    .RotAccel        = 0.033f,  /* rad/s² — derived: 400 N × ~1.5 m arm / 18000 kg·m²
-                                   I_pitch = m(3r²+l²)/12 = 4500×(12+36)/12 = 18000
-                                   Scale from old: 0.394 × (400/10) × (38/18000) = 0.033
-                                   Recalibrate empirically if rotation feels off   */
+    .VehicleMass     = 12000.0f, /* kg — updated 2026-07-11 to match the Unity chaser
+                                   Rigidbody (Scene2.unity ChaserVehicle), which was
+                                   changed from 4500 without updating this table —
+                                   see "Key Coupling Constraints" in Docs/DEV_REFERENCE.md. */
+    .RotAccel        = 0.012f,  /* rad/s² — re-measured 2026-07-11 via ThrusterDiagnostic.cs
+                                   (ThrusterDiagnostic_20260711_172942.log) against the new
+                                   12000 kg mass: avg of +Tx=0.0118, +Ty=0.0123 rad/s² (1.00s
+                                   burn). Roll (+Tz) measured ~2x higher (0.0244) — the control
+                                   law uses one RotAccel for all three axes, so this is
+                                   calibrated toward pitch/yaw (docking-alignment precision)
+                                   rather than roll.                                        */
 
     /* Burn duration limits — scaled to the 5 Hz (0.2s) GNC_CYCLE_DT_S cycle.
        MaxBurnDuration keeps the same ~95% margin the old 1 Hz values had
@@ -55,7 +63,10 @@ GNC_ParamTbl_t GNC_ParamTbl =
        Both phases now hold the centerline continuously; APPROACH uses a
        softer gain to keep burns small enough to avoid the lateral/attitude
        coupling limit cycle under APPROACH's tighter attitude deadband. */
-    .LatKp_Approach    = 0.01f, /* half of LatKp */
+    .LatKp_Approach    = 0.006f, /* softened further from 0.01 (half of LatKp) — smaller
+                                    target velocity per meter of offset means shorter, gentler
+                                    burns during APPROACH, reducing the attitude disturbance
+                                    that was feeding the lateral/attitude limit cycle          */
 
     /* Corridor-relative phase gate for the APPROACH -> CORRECT revert only
        (replaces the old fixed-meter LatCorrectGate — see doc comment in
@@ -70,7 +81,48 @@ GNC_ParamTbl_t GNC_ParamTbl =
        independent of range (replaces the old CorridorMarginIn fraction, which
        let LAT_CORR hand off to APPROACH 4.46 m off-axis at 33 m range — half
        the corridor cone there, but nowhere near converged). */
-    .LatEntryThreshold_m = 0.3f,  /* m — LAT_CORR must reach this before entering APPROACH   */
+    .LatEntryThreshold_m = 0.05f, /* m — LAT_CORR must reach this before entering APPROACH.
+                                      Tightened from 0.3 -> 0.1 -> 0.05 over the course of
+                                      2026-07-18. 0.05m sits with margin under real docking
+                                      capture envelopes (IDSS/NDS-class mechanical capture
+                                      tolerates several cm to ~10cm laterally, several degrees
+                                      angularly — the ring's own guide petals do final
+                                      centering, GNC only needs to deliver into that envelope
+                                      reliably) — deliberately tighter than strictly required
+                                      so APPROACH has margin against CW drift/noise, while
+                                      still being clearly above the observed ~0.01-0.02m
+                                      sensor/actuator noise floor so the gate stays reachable.
+                                      See LatVelDeadband_ms below — tightened to match, same
+                                      proportion as the 0.3->0.1 step. */
+
+    /* CORRECT -> APPROACH settle gate — see doc comment in gnc_app_tbl.h. Added
+       2026-07-18: a run that hit LatEntryThreshold_m still had attitude visibly
+       drifting on all three axes at the exact cycle APPROACH committed, so axial
+       closure and residual attitude motion fought each other from the first
+       APPROACH cycle. These three add "stopped and steady," not just "position
+       crossed a line," to the entry condition.
+       LatEntryVelMax_ms / AttEntryRateMax_rads: left UNCHANGED when
+         LatEntryThreshold_m tightened to 0.05 — unlike LatVelDeadband_ms, these
+         aren't mathematically tied to the position threshold (they're "is it
+         genuinely stopped," not "how small is the position error"), and they're
+         already only ~2x the observed 0.004-0.006 rad/s / ~0.01 m/s noise floor.
+         Tightening them further risked the settle gate never being satisfiable
+         at all given real sensor/actuator noise — the same failure mode that
+         motivated adding EntrySettleCycles in the first place.
+       EntrySettleCycles: raised 10 -> 15 (3s @ 5Hz, was 2s) — a tighter position
+         target benefits from a longer hold to confirm it's a real convergence
+         and not one lucky low-noise sample, now that LatEntryThreshold_m gives
+         less room for a spurious pass. */
+    .LatEntryVelMax_ms    = 0.01f,  /* m/s — |Vel_X|,|Vel_Y| must both be below this   */
+    .AttEntryRateMax_rads = 0.01f,  /* rad/s — |AngVel_X/Y/Z| must all be below this   */
+    .EntrySettleCycles    = 15.0f,  /* consecutive cycles all conditions must hold     */
+
+    /* APPROACH -> CORRECT attitude revert — see doc comment in gnc_app_tbl.h.
+       6.0 sits with 4° of margin below DockingDetector's 10° capture requirement
+       (Assets/DockingDetector.cs maxAttitudeError) and well above AttDeadband_deg's
+       1° APPROACH operating band (2.0 x 0.5), so normal correction transients
+       don't trip it. */
+    .AttRevertThreshold_deg = 6.0f, /* deg — revert APPROACH->CORRECT if any axis exceeds this */
 
     /* Autonomous hold-point waypoints — set to 0.0 to disable */
     .HoldPoint1_m    = 20.0f,   /* m — outer waypoint; GNC pauses here for GO    */
@@ -85,29 +137,36 @@ GNC_ParamTbl_t GNC_ParamTbl =
     /* In APPROACH phase the code tightens this to 0.5× (1.0°) automatically so
        attitude is held more precisely as the vehicle closes on the port.          */
 
-    /* Spin-rate override — see doc comment in gnc_app_tbl.h. Tighter than the
-       old hardcoded 0.01 rad/s: a real drift of ~0.0089 rad/s (a residual rate
-       left over from a prior correction, not an active burn — telemetry showed
-       zero force/torque commanded the entire time) slipped under both that and
-       the angle deadband simultaneously, taking ~10s to accumulate into a ~8°
-       swing before anything corrected it.
-       NOT YET RETUNED: a 2026-07-05 run showed an even slower yaw drift
-       (~0.0025 rad/s, still below this threshold) followed by a large
-       overshoot straight through zero once correction did engage. AngVel_X/Y/Z
-       were added to the wakeup EVS log to get direct rate data before touching
-       this value or the attitude control law further — don't guess-tune this
-       without that telemetry. */
-    .SpinThreshold_rads = 0.003f, /* rad/s — fires correction even inside AttDeadband_deg */
+    /* Spin-rate override — see doc comment in gnc_app_tbl.h.
+       RETUNED 2026-07-18 using the AngVel_X/Y/Z telemetry added for exactly this
+       purpose. A 2026-07-18 LAT_CORR run showed sustained roll rate sitting at
+       W_Z=0.001-0.003 rad/s for ~130 consecutive cycles (26s) — right on top of
+       the old 0.003 threshold, so it never reliably cleared `> spin_th` and the
+       roll error was left to drift on AttDeadband_deg alone, climbing from 0° to
+       4° unpunished before the angle deadband finally caught it (by which point
+       the correction was a large, near-saturated multi-axis burn — see the
+       LAT_CORR +Fz coupling feedforward comment below for what that triggered).
+       Raised to 0.006 rad/s — a clear 2x margin above the observed 0.003 rad/s
+       noise floor — so a genuine sustained residual rate reliably trips the
+       override instead of straddling it. */
+    .SpinThreshold_rads = 0.006f, /* rad/s — fires correction even inside AttDeadband_deg */
 
-    /* Lateral velocity deadband — see doc comment in gnc_app_tbl.h.
-       Lowered from 0.015 — at LatKp=0.02 that created a ~0.75m dead zone the
-       lateral position controller couldn't correct inside of at all, bigger
-       than LatEntryThreshold_m (0.3m), so LAT_CORR could never actually
-       converge enough to leave. 0.002 keeps the dead zone (~0.1m) safely
-       inside the entry threshold; MinBurnDuration already imposes a similar
-       (~0.0018 m/s) floor on its own, so this isn't giving up much filtering
-       against genuine actuator/noise chatter. */
-    .LatVelDeadband_ms = 0.002f, /* m/s — coast when velocity error is this small */
+    /* Lateral velocity deadband — see doc comment in gnc_app_tbl.h. Now split
+       by phase so CORRECT's convergence precision and APPROACH's anti-chatter
+       margin don't have to share one value.
+
+       CORRECT: tightened again, 0.0007 -> 0.00035, tracking LatEntryThreshold_m's
+       0.1m -> 0.05m drop with the same proportion as the previous 0.3->0.1 step
+       (dead zone = deadband/LatKp(0.02), so halving the deadband when the entry
+       gate also halves holds the dead-zone-to-gate ratio at ~35%, the same
+       comfortable margin used each time this has been tightened — see the
+       LAT_CORR-stuck-at-0.75m history in the header doc comment for what
+       happens when that margin isn't kept).
+
+       APPROACH: kept at 0.002, unchanged since the original phase split —
+       this tightening pass is CORRECT-only, same as last time. */
+    .LatVelDeadband_ms          = 0.00035f, /* m/s — CORRECT: coast below this */
+    .LatVelDeadband_Approach_ms = 0.002f,   /* m/s — APPROACH: coast below this */
     /* The limit cycle: lateral burn disturbs roll ~0.5–1°; at AttKp=0.50 that   */
     /* fires a correction every cycle; the correction couples back into lateral.  */
     /* With a 2° deadband, sub-2° perturbations coast rather than being fought.  */
@@ -120,18 +179,27 @@ GNC_ParamTbl_t GNC_ParamTbl =
     **
     ** To recalibrate: run cFS, observe a full-power 0.95 s brake burn in the log,
     ** read Δv from consecutive cycle speed readings, compute Δv / 0.95.
-    **   Hard  (T08-T15): (0.355 - 0.088) / 0.95 = 0.281 m/s²
-    **   Light (T08-T11): (0.088 - (-0.041)) / 0.95 = 0.136 m/s²
-    ** If thrusterForce or scene geometry changes, re-measure rather than recompute. */
-    .BrakeAccel_Hard_mss  = 0.281f,   /* m/s² — T08-T15, all 8 brake thrusters      */
-    .BrakeAccel_Light_mss = 0.136f,   /* m/s² — T08-T11 only (Brake-Yaw group)      */
-    .ApproachAccel_mss    = 0.163f,   /* m/s² — T04-T07 approach group; from: 0.155 m/s / 0.95 s */
+    ** If thrusterForce or scene geometry changes, re-measure rather than recompute.
+    **
+    ** Re-measured 2026-07-11 via ThrusterDiagnostic.cs against VehicleMass = 12000
+    ** (ThrusterDiagnostic_20260711_172942.log, 1.00s burns — body-frame log confirms
+    ** zero off-axis coupling on all three, so these are clean single-axis readings):
+    **   Hard  (T08-T15): dV.z = -0.1890 m/s over 1.00s = 0.189 m/s²
+    **   Light (T08-T11): dV.z = -0.1332 m/s over 1.00s = 0.133 m/s²
+    **   Approach (T04-T07): dV.z = +0.0313 m/s over 1.00s = 0.031 m/s² */
+    .BrakeAccel_Hard_mss  = 0.189f,   /* m/s² — T08-T15, all 8 brake thrusters      */
+    .BrakeAccel_Light_mss = 0.133f,   /* m/s² — T08-T11 only (Brake-Yaw group)      */
+    .ApproachAccel_mss    = 0.031f,   /* m/s² — T04-T07 approach group               */
 
     /* Axial hold-position controller (HOLD phase) — same magnitude as LatKp/
     ** MaxLatSpeed; gentle enough not to fight the brake burn's own overshoot
     ** while still walking accumulated range drift back to HoldRange_m. */
     .AxialHoldKp     = 0.02f,   /* target closing speed = KP × range error (m/s per m) */
     .MaxHoldSpeed    = 0.05f,   /* cap on hold-correction closing speed (m/s)          */
+
+    /* ~10 missed 5 Hz cycles (GNC_CYCLE_DT_S) before GNC_APP_ProcessWakeup forces
+       an auto-abort — see doc comment in gnc_app_tbl.h. */
+    .TlmLossTimeoutSec = 2.0f,  /* s */
 };
 
 /*

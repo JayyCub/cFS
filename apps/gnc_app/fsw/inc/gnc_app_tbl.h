@@ -21,9 +21,11 @@
 **
 ** COUPLING WARNING: ThrusterForce and VehicleMass must always match the values
 ** set in the Unity Inspector (RCSModel.thrusterForce and Rigidbody mass).
-** If they drift, every burn duration will be systematically wrong.
+** If they drift, every burn duration will be systematically wrong. See "Key
+** Coupling Constraints" in Docs/DEV_REFERENCE.md for the full list of values
+** that must stay in sync between this table and the Unity scripts.
 **
-** Layout: 28 × float = 112 bytes. Naturally 4-byte aligned; no padding required.
+** Layout: 34 × float = 136 bytes. Naturally 4-byte aligned; no padding required.
 */
 typedef struct
 {
@@ -104,6 +106,43 @@ typedef struct
                                 ** offset exceeds this fraction                                */
 
     /*
+    ** CORRECT -> APPROACH settle gate (rate + duration).
+    **
+    ** LatEntryThreshold_m alone is a single-sample position check: the instant
+    ** LateralOffset_m crosses it, APPROACH commits and Channel 1 immediately
+    ** starts axial closure — even if lateral velocity or attitude rate are
+    ** still actively changing at that exact instant. These three fields add a
+    ** real "stopped and steady" requirement on top of the position check:
+    ** lateral speed and attitude rate must also be under their own thresholds,
+    ** and all three conditions must hold simultaneously for EntrySettleCycles
+    ** consecutive wakeup cycles (tracked by GNC_APP_Data.SettleCounter) before
+    ** the transition actually fires. Any cycle where any condition fails resets
+    ** the counter to zero — no partial credit across a blip.
+    */
+    float LatEntryVelMax_ms;    /* m/s — |Vel_X| and |Vel_Y| must both be below this   */
+    float AttEntryRateMax_rads; /* rad/s — |AngVel_X/Y/Z| must all be below this       */
+    float EntrySettleCycles;    /* consecutive cycles all conditions must hold         */
+
+    /*
+    ** APPROACH -> CORRECT attitude revert threshold.
+    **
+    ** The lateral corridor gate above will pull the vehicle back to CORRECT if
+    ** it drifts too far off-axis, but nothing previously checked attitude
+    ** during APPROACH — a vehicle that stayed laterally centered while tilting
+    ** or yawing hard would sail through unchecked until DockingDetector's
+    ** one-shot maxAttitudeError (10°, checked only at contact) failed capture.
+    ** This mirrors the corridor check for the rotational axes: if the worst of
+    ** |PitchError_deg|, |YawError_deg|, |RollError_deg| exceeds this during
+    ** APPROACH, revert to CORRECT (whose wider AttDeadband_deg and station-kept
+    ** axial channel give the attitude loop room to actually recover) instead of
+    ** continuing to close range while pointed the wrong way. Set clearly below
+    ** the 10° capture requirement so there's real margin to correct before
+    ** contact, but well above AttDeadband_deg's 1° APPROACH operating band so
+    ** normal correction transients don't trigger nuisance reverts.
+    */
+    float AttRevertThreshold_deg; /* deg — revert APPROACH->CORRECT if any axis exceeds this */
+
+    /*
     ** Autonomous hold-point waypoints (range thresholds, approach axis).
     ** SelectPhase transitions to HOLD when range drops to or below each
     ** threshold during APPROACH.  Each hold point fires at most once per
@@ -152,7 +191,8 @@ typedef struct
                                ** once |AngVel| on any axis reaches this              */
 
     /*
-    ** Lateral velocity deadband
+    ** Lateral velocity deadband — split by phase.
+    **
     ** Only fire a lateral correction burn when the velocity error exceeds this
     ** threshold.  Without it, 400 N thrusters create a bang-bang limit cycle:
     ** each impulse overshoots the target lateral velocity, the next cycle
@@ -160,19 +200,27 @@ typedef struct
     ** sign every cycle.  A small deadband lets the vehicle coast through tiny
     ** velocity errors instead of chasing them.
     **
-    ** MUST stay well below LatKp × (smallest lateral offset still worth
-    ** actively correcting) — GNC_APP_LateralAxis's target velocity is
-    ** v_tgt = -LatKp × pos, so if this deadband exceeds that product the
-    ** controller never clears it and does nothing at all below
-    ** pos = LatVelDeadband_ms / LatKp. At the old 0.015, that floor was
-    ** 0.015/0.02 = 0.75 m — larger than LatEntryThreshold_m (0.3 m), so
-    ** LAT_CORR could get stuck orbiting the edge of that dead zone forever,
-    ** never converging enough to hand off to APPROACH (confirmed in
-    ** telemetry: F=(0,0,0) for 80+ consecutive cycles while Lat climbed
-    ** freely from 0.67 m to 0.85 m). Lowered so the dead zone (now ~0.1 m)
-    ** sits safely inside the entry threshold instead of outside it.
+    ** MUST stay well below Kp × (smallest lateral offset still worth actively
+    ** correcting) for the phase it applies to — GNC_APP_LateralAxis's target
+    ** velocity is v_tgt = -Kp × pos, so if the deadband exceeds that product
+    ** the controller never clears it and does nothing at all below
+    ** pos = deadband / Kp. At the old shared 0.015, that floor was
+    ** 0.015/0.02 = 0.75 m — larger than LatEntryThreshold_m, so LAT_CORR could
+    ** get stuck orbiting the edge of that dead zone forever, never converging
+    ** enough to hand off to APPROACH (confirmed in telemetry: F=(0,0,0) for
+    ** 80+ consecutive cycles while Lat climbed freely from 0.67 m to 0.85 m).
+    **
+    ** CORRECT needs a tight deadband so it can actually converge to
+    ** LatEntryThreshold_m (dead zone must sit comfortably inside that gate).
+    ** APPROACH wants a looser one: LatKp_Approach is already halved so its
+    ** burns stay small, but constantly re-firing on sub-centimeter noise still
+    ** disturbs attitude and feeds the lateral/attitude limit cycle documented
+    ** on AttDeadband_deg — a wider dead zone here lets it coast through that
+    ** noise instead of chasing it. A single shared value could not satisfy
+    ** both constraints at once, hence the split.
     */
-    float LatVelDeadband_ms; /* m/s — ignore lateral velocity errors below this */
+    float LatVelDeadband_ms;          /* m/s — CORRECT phase deadband */
+    float LatVelDeadband_Approach_ms; /* m/s — APPROACH phase deadband (looser) */
 
     /*
     ** Braking deceleration constants — calibrated to actual Unity thruster geometry.
@@ -204,6 +252,17 @@ typedef struct
     */
     float AxialHoldKp;       /* target closing speed = KP × (Range_m - HoldRange_m) (m/s per m) */
     float MaxHoldSpeed;      /* cap on hold-correction closing speed                (m/s)        */
+
+    /*
+    ** Telemetry-loss watchdog.
+    ** If no fresh Unity telemetry packet arrives for this many seconds, GNC_APP
+    ** forces IDLE + AbortLatch (same effect as a ground ABORT command) rather
+    ** than continuing to coast silently. This exists because the field this
+    ** watchdog reads (HkTlm.TlmStaleSec) was originally scoped as an LC
+    ** watchpoint, but LC_APP is not part of this target's app list — see
+    ** GNC_APP_ProcessWakeup for the actual check.
+    */
+    float TlmLossTimeoutSec; /* s — consecutive telemetry loss before auto-abort */
 
 } GNC_ParamTbl_t;
 
