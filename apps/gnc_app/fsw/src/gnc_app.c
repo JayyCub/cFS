@@ -741,12 +741,13 @@ static GNC_Control_t GNC_APP_ComputeControl(const GNC_APP_UnityTlm_t *tlm, GNC_P
     {
         const float d2r = 0.01745329f;  /* π / 180 */
 
-        /* Attitude deadband by phase:
-        **   LAT_CORR  2× (4°): lateral burns disturb attitude ~0.5-2°; a wider
+        /* Attitude deadband by phase (multipliers apply to AttDeadband_deg,
+        ** currently 1.0° baseline — see 2026-07-25 note in gnc_param_tbl.c):
+        **   LAT_CORR  2× (2°): lateral burns disturb attitude ~0.5-2°; a wider
         **             deadband lets those perturbations coast rather than triggering
         **             T08-T15 corrections whose -Z coupling drives the vehicle back.
-        **   APPROACH  0.5× (1°): tighten for nose-on-port precision.
-        **   HOLD      1× (2°): baseline. */
+        **   APPROACH  0.5× (0.5°): tighten for nose-on-port precision.
+        **   HOLD      1× (1°): baseline. */
         float       att_db_deg;
         if      (phase == GNC_PHASE_APPROACH) att_db_deg = p->AttDeadband_deg * 0.5f;
         else if (phase == GNC_PHASE_CORRECT)  att_db_deg = p->AttDeadband_deg * 2.0f;

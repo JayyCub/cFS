@@ -133,8 +133,16 @@ GNC_ParamTbl_t GNC_ParamTbl =
     .MaxAttRate      =  0.20f,  /* rad/s — cap per axis                          */
 
     /* Attitude deadband — breaks the lateral↔attitude coupling limit cycle      */
-    .AttDeadband_deg =  2.0f,   /* deg — skip correction when all errors < this  */
-    /* In APPROACH phase the code tightens this to 0.5× (1.0°) automatically so
+    /* HALVED 2026-07-25 (2.0 -> 1.0) after the RCS thruster-cant fix: the 2.0°
+       baseline was sized for the ~0.5-1° lateral-burn coupling measured with the
+       old (misangled) thruster geometry. Post-fix ThrusterDiagnostic data shows
+       ~0 coupling on pure translation commands, so the disturbance this deadband
+       was protecting against should be much smaller now. Unverified in closed-
+       loop flight — if the old lateral<->attitude limit cycle (chatter every
+       cycle, correction burns feeding back into lateral motion) reappears in
+       AngVel_X/Y/Z telemetry, revert to 2.0. */
+    .AttDeadband_deg =  1.0f,   /* deg — skip correction when all errors < this  */
+    /* In APPROACH phase the code tightens this to 0.5× (0.5°) automatically so
        attitude is held more precisely as the vehicle closes on the port.          */
 
     /* Spin-rate override — see doc comment in gnc_app_tbl.h.
@@ -148,8 +156,16 @@ GNC_ParamTbl_t GNC_ParamTbl =
        LAT_CORR +Fz coupling feedforward comment below for what that triggered).
        Raised to 0.006 rad/s — a clear 2x margin above the observed 0.003 rad/s
        noise floor — so a genuine sustained residual rate reliably trips the
-       override instead of straddling it. */
-    .SpinThreshold_rads = 0.006f, /* rad/s — fires correction even inside AttDeadband_deg */
+       override instead of straddling it.
+
+       HALVED BACK 2026-07-25 (0.006 -> 0.003) alongside AttDeadband_deg, same
+       rationale: the 0.001-0.003 rad/s noise floor above was measured with the
+       old thruster geometry, which fed real coupling noise into AngVel. If the
+       post-fix noise floor hasn't actually dropped, this value will straddle it
+       again exactly like the pre-07-18 setting did — watch for W_Z sitting flat
+       at 0.001-0.003 rad/s for many consecutive cycles without ever tripping
+       `> spin_th`, and revert to 0.006 if so. */
+    .SpinThreshold_rads = 0.003f, /* rad/s — fires correction even inside AttDeadband_deg */
 
     /* Lateral velocity deadband — see doc comment in gnc_app_tbl.h. Now split
        by phase so CORRECT's convergence precision and APPROACH's anti-chatter
