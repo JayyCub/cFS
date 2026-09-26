@@ -114,10 +114,12 @@ static int32 GNC_APP_ValidateParamTbl(void *TblPtr)
                           "GNC_APP: table rejected — negative manual-control limit");
         return GNC_APP_TBL_VALIDATE_ERR;
     }
-    if (p->TlmLossTimeoutSec <= 0.0f)
+    /* SettleCounter is published as a uint16 in the STATE packet */
+    if (p->EntrySettleCycles > 0xFFFF)
     {
         CFE_EVS_SendEvent(GNC_APP_TBL_VAL_ERR_EID, CFE_EVS_EventType_ERROR,
-                          "GNC_APP: table rejected — TlmLossTimeoutSec %g <= 0", (double)p->TlmLossTimeoutSec);
+                          "GNC_APP: table rejected — EntrySettleCycles %lu > 65535",
+                          (unsigned long)p->EntrySettleCycles);
         return GNC_APP_TBL_VALIDATE_ERR;
     }
 
@@ -150,6 +152,15 @@ CFE_Status_t GNC_APP_Init(void)
     CFE_MSG_Init(CFE_MSG_PTR(GNC_APP_Data.ActReqMsg.TelemetryHeader),
                  CFE_SB_ValueToMsgId(RCS_ACT_REQ_MID),
                  sizeof(GNC_APP_Data.ActReqMsg));
+    CFE_MSG_Init(CFE_MSG_PTR(GNC_APP_Data.StateTlm.TelemetryHeader),
+                 CFE_SB_ValueToMsgId(GNC_APP_STATE_TLM_MID),
+                 sizeof(GNC_APP_Data.StateTlm));
+    CFE_MSG_Init(CFE_MSG_PTR(GNC_APP_Data.LcSampleCmd.CommandHeader),
+                 CFE_SB_ValueToMsgId(LC_SAMPLE_AP_MID),
+                 sizeof(GNC_APP_Data.LcSampleCmd));
+    GNC_APP_Data.LcSampleCmd.Payload.StartIndex = GNC_APP_LC_CYCLE_AP_FIRST;
+    GNC_APP_Data.LcSampleCmd.Payload.EndIndex   = GNC_APP_LC_CYCLE_AP_LAST;
+    GNC_APP_Data.LcSampleCmd.Payload.UpdateAge  = 0;
 
     /* 3. Create SB pipe and subscribe: vehicle state (the cycle trigger),
     **    1 Hz HK request, and ground commands. */
@@ -353,7 +364,7 @@ static GNC_Phase_t GNC_APP_SelectPhase(const GNC_APP_UnityTlm_t *tlm, GNC_Phase_
             if (posOk && velOk && rateOk)
             {
                 GNC_APP_Data.SettleCounter++;
-                if ((float)GNC_APP_Data.SettleCounter >= p->EntrySettleCycles)
+                if (GNC_APP_Data.SettleCounter >= p->EntrySettleCycles)
                 {
                     GNC_APP_Data.SettleCounter = 0;
                     return GNC_PHASE_APPROACH;
@@ -730,10 +741,11 @@ to_impulse:
 /* A commanded burn with almost no corresponding velocity change is the      */
 /* signature of a failed/weak thruster or a table-vs-vehicle mismatch.       */
 /*                                                                           */
-/* Observational only: logs an EVS event and counts it in HK, does not      */
-/* change Phase or AbortLatch. A false positive (CW drift noise, contact     */
-/* forces) is more likely than a real fault, so this is a signal for a       */
-/* human/regression test to notice, not a flight-rules interlock.            */
+/* Measurement only (realism phase 3): GNC publishes the consecutive-cycle   */
+/* streak in the STATE packet and takes no action itself. The decision —     */
+/* how long a streak counts as an anomaly, in which phases, and what to do   */
+/* about it — is LC actionpoint 1 → SC RTS 3 (HOLD), all table-driven, so    */
+/* the flight rules can change without a GNC code change.                    */
 /*                                                                           */
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 static void GNC_APP_CheckActuatorHealth(const GNC_APP_UnityTlm_t *tlm, const GNC_ParamTbl_t *p)
@@ -761,20 +773,86 @@ static void GNC_APP_CheckActuatorHealth(const GNC_APP_UnityTlm_t *tlm, const GNC
 
     if (delivered_fraction < 0.5f)
     {
-        GNC_APP_Data.UnderDeliveryStreak++;
-        if (GNC_APP_Data.UnderDeliveryStreak == 3)
-        {
-            GNC_APP_Data.HkTlm.ActuatorAnomalyCount++;
-            CFE_EVS_SendEvent(GNC_APP_ANOMALY_EID, CFE_EVS_EventType_ERROR,
-                              "GNC_APP: axial actuator anomaly — commanded %.0f N·s burns "
-                              "delivering %.0f%% of predicted Δv for 3 consecutive cycles",
-                              (double)GNC_APP_Data.PrevAchievedPz_Ns, (double)(delivered_fraction * 100.0f));
-        }
+        if (GNC_APP_Data.UnderDeliveryStreak < 0xFFFF)
+            GNC_APP_Data.UnderDeliveryStreak++;
     }
     else
     {
         GNC_APP_Data.UnderDeliveryStreak = 0;
     }
+}
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+/*                                                                           */
+/* GNC_APP_Flags — GNC_APP_FLAG_* bits shared by HK and STATE               */
+/*                                                                           */
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+static uint8 GNC_APP_Flags(void)
+{
+    uint8 f = 0;
+
+    if (GNC_APP_Data.AbortLatch)     f |= GNC_APP_FLAG_ABORT_LATCH;
+    if (GNC_APP_Data.HoldPt1Armed)   f |= GNC_APP_FLAG_HOLDPT1_ARMED;
+    if (GNC_APP_Data.HoldPt2Armed)   f |= GNC_APP_FLAG_HOLDPT2_ARMED;
+    if (GNC_APP_Data.BadCtrlLatched) f |= GNC_APP_FLAG_BAD_CTRL;
+    if (GNC_APP_Data.HaveTlm)
+    {
+        f |= GNC_APP_FLAG_LINK_UP;
+        if (GNC_APP_Data.LatestTlm.Flags & SIMLINK_FLAG_IN_CORRIDOR) f |= GNC_APP_FLAG_IN_CORRIDOR;
+        if (GNC_APP_Data.LatestTlm.Flags & SIMLINK_FLAG_DOCKED)      f |= GNC_APP_FLAG_CONTACT;
+    }
+    return f;
+}
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+/*                                                                           */
+/* GNC_APP_PublishState — per-cycle STATE packet + LC sample request         */
+/*                                                                           */
+/* STATE is the data channel for this cycle (ground console, DS flight data  */
+/* recorder, LC watchpoints). The LC sample request right behind it makes LC */
+/* evaluate the cycle-rate actionpoints against the watchpoint results this  */
+/* STATE just produced — LC's pipe is FIFO, so the STATE is processed first. */
+/*                                                                           */
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+static void GNC_APP_PublishState(const SIM_IO_SimStateMsg_t *Msg, const GNC_Control_t *ctrl)
+{
+    GNC_APP_StateTlm_t       *st  = &GNC_APP_Data.StateTlm;
+    const GNC_APP_UnityTlm_t *tlm = &Msg->State;
+
+    st->SimTime_s            = Msg->SimTime_s;
+    st->Seq                  = Msg->Seq;
+    st->Phase                = (uint8)GNC_APP_Data.Phase;
+    st->Flags                = GNC_APP_Flags();
+    st->UnderDeliveryStreak  = (uint16)GNC_APP_Data.UnderDeliveryStreak;
+    st->SettleCounter        = (GNC_APP_Data.SettleCounter > 0xFFFF) ? 0xFFFF : (uint16)GNC_APP_Data.SettleCounter;
+    st->Range_m              = tlm->Range_m;
+    st->ClosingSpeed_ms      = tlm->ClosingSpeed_ms;
+    st->LateralOffset_m      = tlm->LateralOffset_m;
+    st->LatOffset_m[0]       = tlm->LatOffset_X;
+    st->LatOffset_m[1]       = tlm->LatOffset_Y;
+    st->AttErr_deg[0]        = tlm->PitchError_deg;
+    st->AttErr_deg[1]        = tlm->YawError_deg;
+    st->AttErr_deg[2]        = tlm->RollError_deg;
+    st->AngVel_rads[0]       = tlm->AngVel_X;
+    st->AngVel_rads[1]       = tlm->AngVel_Y;
+    st->AngVel_rads[2]       = tlm->AngVel_Z;
+    st->RelPos_m[0]          = tlm->RelPos_X;
+    st->RelPos_m[1]          = tlm->RelPos_Y;
+    st->RelPos_m[2]          = tlm->RelPos_Z;
+    st->RelVel_ms[0]         = tlm->RelVel_X;
+    st->RelVel_ms[1]         = tlm->RelVel_Y;
+    st->RelVel_ms[2]         = tlm->RelVel_Z;
+    st->LinImpulseReq_Ns[0]  = ctrl->Px;
+    st->LinImpulseReq_Ns[1]  = ctrl->Py;
+    st->LinImpulseReq_Ns[2]  = ctrl->Pz;
+    st->AngImpulseReq_Nms[0] = ctrl->Lx;
+    st->AngImpulseReq_Nms[1] = ctrl->Ly;
+    st->AngImpulseReq_Nms[2] = ctrl->Lz;
+
+    CFE_SB_TimeStampMsg(CFE_MSG_PTR(st->TelemetryHeader));
+    CFE_SB_TransmitMsg(CFE_MSG_PTR(st->TelemetryHeader), true);
+
+    CFE_SB_TransmitMsg(CFE_MSG_PTR(GNC_APP_Data.LcSampleCmd.CommandHeader), true);
 }
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
@@ -785,12 +863,12 @@ static void GNC_APP_CheckActuatorHealth(const GNC_APP_UnityTlm_t *tlm, const GNC
 /* the answer, so this is the whole control cycle:                           */
 /* 1. Validate the cycle and take the state (single task — no mutex).        */
 /* 2. Run the phase state machine.                                           */
-/* 3. Run the control law and publish WRENCH_CMD tagged with this Seq.       */
-/* 4. Log approach state.                                                    */
+/* 3. Run the control law and publish ACT_REQ tagged with this Seq.          */
+/* 4. Publish the STATE packet and request the LC cycle-rate AP sample.      */
 /*                                                                           */
-/* HK publication and the link-loss watchdog run separately on the 1 Hz      */
-/* SEND_HK wakeup (GNC_APP_SendHk) — they must keep working when no          */
-/* SIM_STATE arrives at all.                                                 */
+/* HK publication runs separately on the 1 Hz SEND_HK wakeup                 */
+/* (GNC_APP_SendHk) — it must keep going when no SIM_STATE arrives at all,   */
+/* since its TlmStaleSec is what LC watches for sim-link loss.               */
 /*                                                                           */
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 void GNC_APP_ProcessSimState(const SIM_IO_SimStateMsg_t *Msg)
@@ -801,7 +879,7 @@ void GNC_APP_ProcessSimState(const SIM_IO_SimStateMsg_t *Msg)
     GNC_Control_t      ctrl = {0};
     float              dt   = Msg->State.CycleDt_s;
 
-    GNC_APP_Data.HkTlm.WakeupCount++;
+    GNC_APP_Data.HkTlm.CycleCount++;
 
     /*
     ** Manage the parameter table.
@@ -851,20 +929,22 @@ void GNC_APP_ProcessSimState(const SIM_IO_SimStateMsg_t *Msg)
         return;
     }
 
-    GNC_APP_Data.HkTlm.UdpPacketsReceived++;  /* now counts SIM_STATE messages from SIM_IO */
+    GNC_APP_Data.HkTlm.SimStateCount++;
 
     memcpy(&tlm, &Msg->State, sizeof(tlm));
     GNC_APP_Data.LatestTlm      = tlm;
     GNC_APP_Data.HaveTlm        = true;
     GNC_APP_Data.TlmSinceLastHk = true;
 
-    if (GNC_APP_Data.LinkLossLatched)
+    /* Informational only — whether the outage was long enough to abort is
+    ** LC's call (actionpoint 0), and GO is still the operator's. */
+    if (GNC_APP_Data.HkTlm.TlmStaleSec >= GNC_LINK_RESTORED_EVT_SEC)
     {
-        GNC_APP_Data.LinkLossLatched = false;
         CFE_EVS_SendEvent(GNC_APP_LINK_INF_EID, CFE_EVS_EventType_INFORMATION,
-                          "GNC_APP: sim link restored at Seq %lu (guidance still latched — send GO)",
-                          (unsigned long)Msg->Seq);
+                          "GNC_APP: sim link restored at Seq %lu after %lu s",
+                          (unsigned long)Msg->Seq, (unsigned long)GNC_APP_Data.HkTlm.TlmStaleSec);
     }
+    GNC_APP_Data.HkTlm.TlmStaleSec = 0;
 
     /* A Seq discontinuity (Unity ran free, or restarted) means sim time passed
     ** that the previous command didn't cover — drop the actuator-health
@@ -895,13 +975,7 @@ void GNC_APP_ProcessSimState(const SIM_IO_SimStateMsg_t *Msg)
                               "GNC_APP: CREW MANUAL TAKEOVER (hand controller) — autopilot off until GO");
     }
 
-    /* Update HK so ground tools always reflect the current phase */
-    GNC_APP_Data.HkTlm.Phase           = (uint8)GNC_APP_Data.Phase;
-    GNC_APP_Data.HkTlm.ClosingSpeed_ms = tlm.ClosingSpeed_ms;
-    GNC_APP_Data.HkTlm.LateralOffset_m = tlm.LateralOffset_m;
-    GNC_APP_Data.HkTlm.PitchError_deg  = tlm.PitchError_deg;
-    GNC_APP_Data.HkTlm.YawError_deg    = tlm.YawError_deg;
-    GNC_APP_Data.HkTlm.RollError_deg   = tlm.RollError_deg;
+    GNC_APP_Data.HkTlm.Phase = (uint8)GNC_APP_Data.Phase;
 
     /* Check the previous cycle's axial burn against what actually happened
        this cycle, before overwriting Prev* with this cycle's command below. */
@@ -916,18 +990,22 @@ void GNC_APP_ProcessSimState(const SIM_IO_SimStateMsg_t *Msg)
     GNC_APP_Data.PrevBurnValid       = false;
     GNC_APP_Data.PrevClosingSpeed_ms = tlm.ClosingSpeed_ms;
 
+    GNC_APP_PublishState(Msg, &ctrl);
+
     int inCorridor = (tlm.Flags & SIMLINK_FLAG_IN_CORRIDOR) != 0;
     int docked     = (tlm.Flags & SIMLINK_FLAG_DOCKED) != 0;
 
-    /* Compact per-cycle log (roadmap phase 3 moves this to a telemetry packet;
-    ** it exceeds CFE_MISSION_EVS_MAX_MESSAGE_LENGTH and can truncate).
+    /* Per-cycle one-liner, now a DEBUG event: the STATE packet above is the
+    ** data channel (ground console, DS recorder). EVS filters DEBUG out by
+    ** default; enable it for a console trace with EVS ENABLE_APP_EVENT_TYPE
+    ** (GNC_APP, DEBUG) — see Docs/OPERATIONS.md.
     ** PYR = pitch/yaw/roll error (deg), W = body rates (rad/s),
     ** P = linear impulse request (N·s), L = angular impulse request (N·m·s). */
-    CFE_EVS_SendEvent(GNC_APP_WAKEUP_INF_EID, CFE_EVS_EventType_INFORMATION,
+    CFE_EVS_SendEvent(GNC_APP_WAKEUP_INF_EID, CFE_EVS_EventType_DEBUG,
                       "GNC #%u [%s] Rng=%.2f Spd=%.3f Lat=%.3f "
                       "PYR=%.1f/%.1f/%.1f W=%.3f/%.3f/%.3f C%dD%d "
                       "P=%.0f/%.0f/%.0f L=%.0f/%.0f/%.0f",
-                      (unsigned int)GNC_APP_Data.HkTlm.WakeupCount,
+                      (unsigned int)GNC_APP_Data.HkTlm.CycleCount,
                       PHASE_NAMES[GNC_APP_Data.Phase],
                       (double)tlm.Range_m,
                       (double)tlm.ClosingSpeed_ms,
@@ -945,39 +1023,26 @@ void GNC_APP_ProcessSimState(const SIM_IO_SimStateMsg_t *Msg)
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 /*                                                                           */
-/* GNC_APP_SendHk — 1 Hz SCH_LAB wakeup: link-loss watchdog + HK publish     */
+/* GNC_APP_SendHk — 1 Hz SCH_LAB wakeup: link-staleness count + HK publish   */
 /*                                                                           */
-/* In lock-step, "no SIM_STATE" normally means Unity is paused — and then    */
-/* vehicle physics is paused too, so there's nothing to fly. The watchdog    */
-/* still matters: if Unity times out waiting on us it free-runs (drifting    */
-/* with no FSW in the loop), and GNC must not silently resume guidance on    */
-/* whatever state it finds when the link comes back. Force the same latched  */
-/* safe state a ground ABORT does once loss exceeds TlmLossTimeoutSec.       */
+/* TlmStaleSec counts whole HK periods with no SIM_STATE, starting only once */
+/* the link has been up (a cFS that boots before Unity is not an outage).    */
+/* GNC only counts. LC actionpoint 0 turns a long enough count into SC RTS 2 */
+/* (ABORT) — the same latched safe state a ground ABORT gives, so guidance   */
+/* never silently resumes on whatever state it finds when a free-running     */
+/* Unity reconnects.                                                         */
 /*                                                                           */
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 void GNC_APP_SendHk(void)
 {
-    if (GNC_APP_Data.TlmSinceLastHk)
-        GNC_APP_Data.HkTlm.TlmStaleSec = 0;
-    else
+    if (GNC_APP_Data.HaveTlm && !GNC_APP_Data.TlmSinceLastHk && GNC_APP_Data.HkTlm.TlmStaleSec < 0xFFFFFFFFu)
         GNC_APP_Data.HkTlm.TlmStaleSec++;
     GNC_APP_Data.TlmSinceLastHk = false;
 
-    if (GNC_APP_Data.HaveTlm && !GNC_APP_Data.LinkLossLatched && GNC_APP_Data.ParamTblPtr != NULL &&
-        GNC_APP_Data.Phase != GNC_PHASE_DOCKED &&
-        (float)GNC_APP_Data.HkTlm.TlmStaleSec >= GNC_APP_Data.ParamTblPtr->TlmLossTimeoutSec)
-    {
-        GNC_APP_Data.LinkLossLatched = true;
-        GNC_APP_Data.Phase           = GNC_PHASE_IDLE;
-        GNC_APP_Data.AbortLatch      = true;
-        GNC_APP_Data.HkTlm.Phase     = (uint8)GNC_PHASE_IDLE;
-        CFE_EVS_SendEvent(GNC_APP_TLM_LOSS_EID, CFE_EVS_EventType_CRITICAL,
-                          "GNC_APP: *** SIM LINK LOSS %us — AUTO-ABORT *** "
-                          "all thrust inhibited — send GO to resume",
-                          (unsigned int)GNC_APP_Data.HkTlm.TlmStaleSec);
-    }
+    GNC_APP_Data.HkTlm.Phase = (uint8)GNC_APP_Data.Phase;
+    GNC_APP_Data.HkTlm.Flags = GNC_APP_Flags();
 
-    /* Publish HK telemetry to the SB (TO_LAB will forward it to any ground system) */
+    /* Publish HK telemetry to the SB (TO_LAB forwards it to the ground, LC watches it) */
     CFE_SB_TimeStampMsg(CFE_MSG_PTR(GNC_APP_Data.HkTlm.TelemetryHeader));
     CFE_SB_TransmitMsg(CFE_MSG_PTR(GNC_APP_Data.HkTlm.TelemetryHeader), true);
 }
@@ -1052,7 +1117,7 @@ void GNC_APP_ProcessCmd(CFE_SB_Buffer_t *MsgBuf)
             if (!GNC_APP_VerifyCmdLength(&MsgBuf->Msg, sizeof(GNC_APP_ResetCountersCmd_t))) break;
             GNC_APP_Data.HkTlm.CmdCount           = 0;
             GNC_APP_Data.HkTlm.CmdErrCount        = 0;
-            GNC_APP_Data.HkTlm.UdpPacketsReceived  = 0;
+            GNC_APP_Data.HkTlm.SimStateCount      = 0;
             CFE_EVS_SendEvent(GNC_APP_RST_INF_EID, CFE_EVS_EventType_INFORMATION,
                               "GNC_APP: counters reset");
             break;

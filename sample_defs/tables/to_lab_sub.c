@@ -93,8 +93,11 @@ TO_LAB_Subs_t TO_LAB_Subs =
         {CFE_SB_MSGID_WRAP_VALUE(DS_HK_TLM_MID),         {0, 0}, 1},
         {CFE_SB_MSGID_WRAP_VALUE(LC_HK_TLM_MID),         {0, 0}, 1},
         {CFE_SB_MSGID_WRAP_VALUE(CS_HK_TLM_MID),         {0, 0}, 1},
+        /* Docking mission apps (cpu1-only; raw MIDs because cpu2 shares this table) */
         /* GNC_APP_HK_TLM_MID = 0x0893 */
         {CFE_SB_MSGID_WRAP_VALUE(0x0893),                 {0, 0}, 1},
+        /* GNC_APP_STATE_TLM_MID = 0x0895, per lock-step cycle (5 Hz at real time, more when the sim runs fast) */
+        {CFE_SB_MSGID_WRAP_VALUE(0x0895),                 {0, 0}, 16},
         /* SIM_IO_HK_TLM_MID = 0x0896 */
         {CFE_SB_MSGID_WRAP_VALUE(0x0896),                 {0, 0}, 1},
         /* RCS_HK_TLM_MID = 0x0899 */

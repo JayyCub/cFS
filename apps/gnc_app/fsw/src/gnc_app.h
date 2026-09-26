@@ -5,11 +5,14 @@
 #include "cfe.h"
 #include "osapi.h"
 #include "gnc_app_msgids.h"
+#include "gnc_app_msg.h"
 #include "gnc_app_tbl.h"
 #include "sim_io_msgids.h"
 #include "sim_io_msg.h"
 #include "rcs_msgids.h"
 #include "rcs_msg.h"
+#include "lc_msgids.h"
+#include "lc_msg.h"
 
 /*
 ** Pipe configuration
@@ -104,6 +107,24 @@
 #define GNC_MAX_CYCLE_DT_S 1.0f
 
 /*
+** LC actionpoint rate group sampled by GNC at the end of every control cycle.
+**
+** LC evaluates watchpoints as packets arrive but actionpoints only when asked
+** (LC_SAMPLE_AP_MID). On a flight vehicle the scheduler sends that request in
+** the minor-frame slot right after GNC; here the lock-step SIM_STATE *is* the
+** minor frame, so GNC closes its own cycle with the request. That keeps the
+** per-cycle monitors in sim time — LC's persistence counts cycles, not wall
+** seconds, even when the sim runs faster than real time. The wall-clock group
+** (link loss, which must evaluate when no SIM_STATE arrives) is sampled by
+** SCH_LAB instead. Indices must match sample_defs/cpu1/tables/lc_def_adt.c.
+*/
+#define GNC_APP_LC_CYCLE_AP_FIRST 1
+#define GNC_APP_LC_CYCLE_AP_LAST  1
+
+/* Seconds of silence after which a returning SIM_STATE is worth an event */
+#define GNC_LINK_RESTORED_EVT_SEC 2
+
+/*
 ** Event IDs
 */
 #define GNC_APP_INIT_INF_EID      1
@@ -130,26 +151,13 @@
 #define GNC_APP_HOLDPT2_INF_EID   22  /* autonomous hold point 2 reached            */
 #define GNC_APP_TBL_VAL_ERR_EID   23  /* parameter table failed load-time validation */
 #define GNC_APP_BAD_CTRL_EID      24  /* non-finite control output sanitized to coast */
-#define GNC_APP_TLM_LOSS_EID      25  /* telemetry loss exceeded timeout — auto-abort */
-#define GNC_APP_ANOMALY_EID       26  /* actuator authority anomaly (commanded burn underdelivering) */
+/* 25, 26 retired in realism phase 3: link-loss auto-abort and the actuator
+** anomaly event moved to LC actionpoints (LC emits the event, SC responds). */
 #define GNC_APP_BAD_DT_EID        27  /* SIM_STATE CycleDt_s out of range — cycle skipped */
 #define GNC_APP_LINK_INF_EID      28  /* sim link restored after a stale period            */
 #define GNC_APP_MANUAL_INF_EID    29  /* crew hand-controller takeover                     */
 
-/*
-** Ground command function codes
-**
-** NOOP            — heartbeat; no state change; increments CmdCount.
-** RESET_COUNTERS  — zero CmdCount, CmdErrCount, UdpPacketsReceived.
-** HOLD            — immediately enter HOLD phase (station-keep, await GO).
-** GO              — release HOLD or ABORT latch; resume guidance at CORRECT.
-** ABORT           — inhibit all thrust immediately; latch IDLE until GO received.
-*/
-#define GNC_APP_NOOP_CC            0
-#define GNC_APP_RESET_COUNTERS_CC  1
-#define GNC_APP_HOLD_CC            2
-#define GNC_APP_GO_CC              3
-#define GNC_APP_ABORT_CC           4
+/* Ground command function codes: gnc_app_msg.h (shared with the SC RTS tables) */
 
 /*
 ** CFE_TBL validator return code — GNC_APP_ValidateParamTbl returns this (rather
@@ -164,11 +172,11 @@
 ** Individual typedefs are kept separate so sizeof() checks remain unambiguous
 ** and payloads can be added per-command in a future update without refactoring.
 */
-typedef struct { CFE_MSG_CommandHeader_t CmdHeader; } GNC_APP_NoopCmd_t;
-typedef struct { CFE_MSG_CommandHeader_t CmdHeader; } GNC_APP_ResetCountersCmd_t;
-typedef struct { CFE_MSG_CommandHeader_t CmdHeader; } GNC_APP_HoldCmd_t;
-typedef struct { CFE_MSG_CommandHeader_t CmdHeader; } GNC_APP_GoCmd_t;
-typedef struct { CFE_MSG_CommandHeader_t CmdHeader; } GNC_APP_AbortCmd_t;
+typedef GNC_APP_NoArgsCmd_t GNC_APP_NoopCmd_t;
+typedef GNC_APP_NoArgsCmd_t GNC_APP_ResetCountersCmd_t;
+typedef GNC_APP_NoArgsCmd_t GNC_APP_HoldCmd_t;
+typedef GNC_APP_NoArgsCmd_t GNC_APP_GoCmd_t;
+typedef GNC_APP_NoArgsCmd_t GNC_APP_AbortCmd_t;
 
 /*
 ** GNC operational phase — drives which control law is active each cycle.
@@ -195,12 +203,12 @@ typedef struct { CFE_MSG_CommandHeader_t CmdHeader; } GNC_APP_AbortCmd_t;
 */
 typedef enum
 {
-    GNC_PHASE_IDLE     = 0,  /* awaiting telemetry / abort latched      */
-    GNC_PHASE_CORRECT  = 1,  /* lateral correction + axial station-keep */
-    GNC_PHASE_APPROACH = 2,  /* final approach — axial + lateral hold   */
-    GNC_PHASE_DOCKED   = 3,  /* docked — all thrust inhibited           */
-    GNC_PHASE_HOLD     = 4,  /* ground-commanded hold — await GO        */
-    GNC_PHASE_MANUAL   = 5   /* crew hand-controller flight — await GO  */
+    GNC_PHASE_IDLE     = GNC_APP_PHASE_IDLE,     /* awaiting telemetry / abort latched      */
+    GNC_PHASE_CORRECT  = GNC_APP_PHASE_CORRECT,  /* lateral correction + axial station-keep */
+    GNC_PHASE_APPROACH = GNC_APP_PHASE_APPROACH, /* final approach — axial + lateral hold   */
+    GNC_PHASE_DOCKED   = GNC_APP_PHASE_DOCKED,   /* docked — all thrust inhibited           */
+    GNC_PHASE_HOLD     = GNC_APP_PHASE_HOLD,     /* ground-commanded hold — await GO        */
+    GNC_PHASE_MANUAL   = GNC_APP_PHASE_MANUAL    /* crew hand-controller flight — await GO  */
 } GNC_Phase_t;
 
 /*
@@ -211,38 +219,7 @@ typedef enum
 */
 typedef SIMLINK_SimState_t GNC_APP_UnityTlm_t;
 
-/*
-** Housekeeping telemetry packet (published to SB each wakeup)
-**
-** NOTE: struct layout must remain word-aligned.  Spare[] pads Phase (uint8)
-** to a full 32-bit word so downstream ground tools and COSMOS/OpenMCT field
-** offsets stay deterministic.
-*/
-typedef struct
-{
-    CFE_MSG_TelemetryHeader_t TelemetryHeader;
-    uint32                    WakeupCount;
-    uint32                    CmdCount;
-    uint32                    CmdErrCount;
-    uint32                    UdpPacketsReceived; /* SIM_STATE messages received (name kept for ground-tool offsets) */
-    uint8                     Phase;     /* current GNC_Phase_t value (0=IDLE 1=CORRECT 2=APPROACH 3=DOCKED) */
-    uint8                     Spare[3];  /* explicit alignment padding — do not reuse without updating tools */
-    /* Phase 5D — LC watchpoint fields (offsets 32, 36, 40) */
-    float                     ClosingSpeed_ms;   /* latest Unity closing speed; mirrored for LC overspeed WP */
-    float                     LateralOffset_m;   /* latest Unity lateral offset; mirrored for LC corridor WP */
-    uint32                    TlmStaleSec;       /* consecutive 1 Hz HK periods with no SIM_STATE from
-                                                  ** SIM_IO (now genuinely seconds of wall time). Drives the
-                                                  ** sim-link-loss auto-abort in GNC_APP_SendHk. */
-    uint32                    ActuatorAnomalyCount; /* times the axial actuator-health monitor flagged a
-                                                     ** commanded burn as significantly underdelivering        */
-    /* Attitude — previously visible only in the (often line-truncated) EVS
-    ** wakeup log text, not as an actual telemetry point a ground tool could
-    ** trend or alarm on. Mirrors the latest Unity telemetry each wakeup cycle,
-    ** same pattern as ClosingSpeed_ms/LateralOffset_m above. */
-    float                     PitchError_deg;
-    float                     YawError_deg;
-    float                     RollError_deg;
-} GNC_APP_HkTlm_t;
+/* HK and per-cycle STATE telemetry packets: gnc_app_msg.h */
 
 /*
 ** Application global data
@@ -265,11 +242,11 @@ typedef struct
     bool               BadCtrlLatched; /* true while the last ComputeControl output was non-finite;
                                         ** suppresses repeat GNC_APP_BAD_CTRL_EID events for the same episode */
 
-    /* Axial actuator-health monitor (Phase 2) — compares the previous cycle's
-    ** commanded axial burn against the closing-speed change actually observed
-    ** this cycle, to catch a thruster-delivery regression (like the allocator
-    ** under-delivery bug) automatically instead of relying on someone reading
-    ** the EVS log. Observational only — see GNC_APP_CheckActuatorHealth. */
+    /* Axial actuator-health monitor — compares the previous cycle's commanded
+    ** axial burn against the closing-speed change actually observed this
+    ** cycle. GNC only measures (UnderDeliveryStreak, published in STATE); LC
+    ** decides when that is an anomaly and SC responds — see
+    ** GNC_APP_CheckActuatorHealth. */
     float              PrevAchievedPz_Ns;   /* axial impulse RCS actually commanded last cycle (N·s) */
     bool               PrevBurnValid;       /* PrevAchievedPz_Ns is valid for the previous Seq       */
     float              PrevClosingSpeed_ms; /* ClosingSpeed_ms when that impulse was requested       */
@@ -280,13 +257,16 @@ typedef struct
     GNC_APP_UnityTlm_t LatestTlm;          /* most recent SIM_STATE payload                 */
     bool               HaveTlm;            /* at least one SIM_STATE received                */
     bool               TlmSinceLastHk;     /* SIM_STATE seen since the previous 1 Hz HK tick */
-    bool               LinkLossLatched;    /* auto-abort fired for the current outage        */
 
     uint32             PrevSeq;            /* Seq of the previous SIM_STATE (continuity check) */
     bool               HavePrevSeq;
 
     /* Actuator command output (SB) */
     RCS_ActReqMsg_t    ActReqMsg;
+
+    /* Per-cycle state telemetry and the LC sample request that closes each cycle */
+    GNC_APP_StateTlm_t StateTlm;
+    LC_SampleAPCmd_t   LcSampleCmd;
 
     /* CFE_TBL parameter table */
     CFE_TBL_Handle_t        ParamTblHandle;

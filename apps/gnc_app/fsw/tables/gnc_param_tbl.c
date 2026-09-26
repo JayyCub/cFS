@@ -99,7 +99,7 @@ GNC_ParamTbl_t GNC_ParamTbl =
          less room for a spurious pass. */
     .LatEntryVelMax_ms    = 0.01f,  /* m/s — |Vel_X|,|Vel_Y| must both be below this   */
     .AttEntryRateMax_rads = 0.01f,  /* rad/s — |AngVel_X/Y/Z| must all be below this   */
-    .EntrySettleCycles    = 15.0f,  /* consecutive cycles all conditions must hold     */
+    .EntrySettleCycles    = 15,     /* consecutive cycles all conditions must hold     */
 
     /* APPROACH -> CORRECT attitude revert — see doc comment in gnc_app_tbl.h.
        6.0 sits with 4° of margin below DockingDetector's 10° capture requirement
@@ -182,10 +182,6 @@ GNC_ParamTbl_t GNC_ParamTbl =
     ** while still walking accumulated range drift back to HoldRange_m. */
     .AxialHoldKp     = 0.02f,   /* target closing speed = KP × range error (m/s per m) */
     .MaxHoldSpeed    = 0.05f,   /* cap on hold-correction closing speed (m/s)          */
-
-    /* 2 s of wall time with no SIM_STATE before GNC_APP_SendHk forces an
-       auto-abort — see doc comment in gnc_app_tbl.h. */
-    .TlmLossTimeoutSec = 2.0f,  /* s */
 
     /* Crew manual flight (MANUAL phase). Full THC ≈ 240 N of net thrust at
        12000 kg; full RHC = 1 °/s. The rate-hold deadband sits above the RCS

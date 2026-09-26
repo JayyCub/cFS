@@ -117,7 +117,7 @@ typedef struct
     */
     float LatEntryVelMax_ms;    /* m/s — |Vel_X| and |Vel_Y| must both be below this   */
     float AttEntryRateMax_rads; /* rad/s — |AngVel_X/Y/Z| must all be below this       */
-    float EntrySettleCycles;    /* consecutive cycles all conditions must hold         */
+    uint32 EntrySettleCycles;   /* consecutive cycles all conditions must hold         */
 
     /*
     ** APPROACH -> CORRECT attitude revert threshold.
@@ -236,12 +236,9 @@ typedef struct
     float MaxHoldSpeed;      /* cap on hold-correction closing speed                (m/s)        */
 
     /*
-    ** Telemetry-loss watchdog.
-    ** If no SIM_STATE arrives for this many seconds (checked on the 1 Hz HK
-    ** tick, GNC_APP_SendHk), GNC_APP forces IDLE + AbortLatch (same effect as a
-    ** ground ABORT command) rather than resuming blindly when the link returns.
+    ** (Telemetry-loss timeout removed in realism phase 3: the threshold is now
+    ** the LC link-loss watchpoint in sample_defs/cpu1/tables/lc_def_wdt.c.)
     */
-    float TlmLossTimeoutSec; /* s — consecutive telemetry loss before auto-abort */
 
     /*
     ** Crew manual flight (MANUAL phase, hand controllers).

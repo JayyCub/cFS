@@ -19,6 +19,11 @@ set(APP_INCLUDE_TABLE_LIST
     $<TARGET_PROPERTY:sc,INCLUDE_DIRECTORIES>
     $<TARGET_PROPERTY:ds,INCLUDE_DIRECTORIES>
     $<TARGET_PROPERTY:hk,INCLUDE_DIRECTORIES>
+    # docking mission apps: MIDs, command codes and packet layouts used by the
+    # scheduler, TO_LAB, LC watchpoint, SC RTS, DS and HS tables
+    $<TARGET_PROPERTY:gnc_app,INCLUDE_DIRECTORIES>
+    $<TARGET_PROPERTY:sim_io,INCLUDE_DIRECTORIES>
+    $<TARGET_PROPERTY:rcs,INCLUDE_DIRECTORIES>
 )
 
 if (TARGET sbn)
@@ -30,11 +35,13 @@ if (TARGET sbn)
     )
 endif()
 
-# specify extra include dirs for to_lab + sch_lab table builds
-target_include_directories(to_lab.table INTERFACE ${APP_INCLUDE_TABLE_LIST})
-target_compile_definitions(to_lab.table INTERFACE ${APP_DEFINITION_TABLE_LIST})
-target_include_directories(sch_lab.table INTERFACE ${APP_INCLUDE_TABLE_LIST})
-target_compile_definitions(sch_lab.table INTERFACE ${APP_DEFINITION_TABLE_LIST})
+# specify extra include dirs for the table builds that reference other apps'
+# messages: to_lab + sch_lab (routing/scheduling), and the FDIR / recorder
+# tables (lc watchpoints + actionpoints, sc RTSs, ds recorder, hs app monitor)
+foreach(TBL_APP to_lab sch_lab lc sc ds hs)
+    target_include_directories(${TBL_APP}.table INTERFACE ${APP_INCLUDE_TABLE_LIST})
+    target_compile_definitions(${TBL_APP}.table INTERFACE ${APP_DEFINITION_TABLE_LIST})
+endforeach()
 
 # An example of an alternate table load file
 add_cfe_tables(sample_app sample_app_alt1.c)

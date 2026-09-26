@@ -64,11 +64,19 @@ SCH_LAB_ScheduleTable_t SCH_TBL_Structure =
         {CFE_SB_MSGID_WRAP_VALUE(CI_LAB_SEND_HK_MID),     50, 0}, /* every 5.0 seconds */
         {CFE_SB_MSGID_WRAP_VALUE(TO_LAB_SEND_HK_MID),     52, 0}, /* every 5.2 seconds */
         {CFE_SB_MSGID_WRAP_VALUE(SAMPLE_APP_SEND_HK_MID), 54, 0}, /* every 5.4 seconds */
-        {CFE_SB_MSGID_WRAP_VALUE(0x1894),                 10, 0}, /* GNC_APP_SEND_HK_MID, 1 Hz HK + link
-                                                                      watchdog. The GNC control cycle runs
-                                                                      lock-step on SIM_IO SIM_STATE, not here. */
+        /* Docking mission apps are cpu1-only, and this table is shared with
+        ** cpu2 (whose build has no gnc_app/sim_io/rcs headers) — hence raw MIDs. */
+        {CFE_SB_MSGID_WRAP_VALUE(0x1894),                 10, 0}, /* GNC_APP_SEND_HK_MID, 1 Hz HK (TlmStaleSec
+                                                                      for the LC link-loss WP). The GNC control
+                                                                      cycle runs lock-step on SIM_IO SIM_STATE. */
         {CFE_SB_MSGID_WRAP_VALUE(0x1897),                 10, 0}, /* SIM_IO_SEND_HK_MID, 1 Hz */
         {CFE_SB_MSGID_WRAP_VALUE(0x18A2),                 10, 0}, /* RCS_SEND_HK_MID, 1 Hz (also RCS table manage) */
+        /* LC wall-clock actionpoint group: AP 0 (sim link loss) must evaluate
+        ** while no SIM_STATE arrives, so it is sampled here at 1 Hz rather than
+        ** by gnc_app's per-cycle request (which samples APs 1..1). Payload =
+        ** LC_SampleAP_Payload_t {StartIndex, EndIndex, UpdateAge, Padding}. */
+        {CFE_SB_MSGID_WRAP_VALUE(LC_SAMPLE_AP_MID),       10, 0, 8, {0, 0, 0, 0}},
+        {CFE_SB_MSGID_WRAP_VALUE(HS_WAKEUP_MID),          10, 0}, /* 1 Hz health & safety monitor cycle */
         {CFE_SB_MSGID_WRAP_VALUE(CF_SEND_HK_MID),         56, 0}, /* every 5.6 seconds */
         {CFE_SB_MSGID_WRAP_VALUE(CF_WAKE_UP_MID),         1,  0}, /* every 0.1 seconds (example of 10 Hz packet) */
         {CFE_SB_MSGID_WRAP_VALUE(MD_SEND_HK_MID),         58, 0}, /* every 5.8 seconds */
@@ -77,7 +85,7 @@ SCH_LAB_ScheduleTable_t SCH_TBL_Structure =
         {CFE_SB_MSGID_WRAP_VALUE(SC_WAKEUP_MID),           10, 0}, /* every 1.0 seconds (example of 1 Hz packet) */
         {CFE_SB_MSGID_WRAP_VALUE(FM_SEND_HK_MID),          66, 0}, /* every 6.6 seconds */
         {CFE_SB_MSGID_WRAP_VALUE(DS_SEND_HK_MID),          68, 0}, /* every 6.8 seconds */
-        {CFE_SB_MSGID_WRAP_VALUE(LC_SEND_HK_MID),          70, 0}, /* every 7.0 seconds */
+        {CFE_SB_MSGID_WRAP_VALUE(LC_SEND_HK_MID),          10, 0}, /* 1 Hz: actionpoint states for the ground console */
         {CFE_SB_MSGID_WRAP_VALUE(CS_SEND_HK_MID),          72, 0}, /* every 7.1 seconds */
         {CFE_SB_MSGID_WRAP_VALUE(CS_BACKGROUND_CYCLE_MID), 5,  0}, /* every 0.5 seconds (example of 2 Hz packet) */
         {CFE_SB_MSGID_WRAP_VALUE(MM_SEND_HK_MID),          74, 0}, /* every 7.4 seconds */
