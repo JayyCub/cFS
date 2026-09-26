@@ -6,26 +6,18 @@
 #include "osapi.h"
 #include "gnc_app_msgids.h"
 #include "gnc_app_tbl.h"
+#include "sim_io_msgids.h"
+#include "sim_io_msg.h"
 
 /*
 ** Pipe configuration
+**
+** GNC owns no sockets: vehicle state arrives as SIM_IO_SIM_STATE_MID and the
+** actuator command leaves as SIM_IO_WRENCH_CMD_MID, both on the Software Bus.
+** SIM_STATE arrival IS the control-cycle trigger (lock-step with the sim).
 */
 #define GNC_APP_PIPE_NAME  "GNC_CMD_PIPE"
 #define GNC_APP_PIPE_DEPTH 32
-
-/*
-** UDP receive (Unity → cFS telemetry)
-*/
-#define GNC_APP_UDP_LISTEN_PORT 5005
-#define GNC_APP_UDP_TASK_NAME   "GNC_UDP_RECV"
-#define GNC_APP_UDP_STACK_SIZE  16384
-#define GNC_APP_UDP_TASK_PRIO   80      /* lower priority than the main app task (55) */
-
-/*
-** UDP command (cFS → Unity thruster commands)
-*/
-#define GNC_APP_CMD_PORT        5006
-#define GNC_APP_CMD_TARGET_HOST "host.docker.internal"
 
 /*
 ** GNC controller gain defaults — documented here for reference.
@@ -116,14 +108,13 @@
 #define GNC_DEG2RAD  0.01745329f  /* π / 180 — shared by attitude and corridor-angle math */
 
 /*
-** GNC wakeup period — must match the GNC_APP_SEND_HK_MID (0x1894) entry in
-** sample_defs/tables/sch_lab_table.c. Previously implicitly 1.0s (1 Hz); the
-** CW feedforward in ComputeControl multiplies by this to get a per-cycle
-** delta-v instead of assuming a 1-second cycle, so the two must stay in sync
-** or the feedforward silently over/under-corrects by the ratio between the
-** assumed and actual period.
+** GNC cycle period — no longer a compile-time constant. Each SIM_STATE carries
+** CycleDt_s (the sim time one lock-step cycle covers, nominally 0.2 s / 5 Hz,
+** set by Unity's UdpTelemetrySender.gncCycleSec). Samples outside this range
+** are rejected rather than fed to the CW feedforward.
 */
-#define GNC_CYCLE_DT_S  0.2f  /* s — 5 Hz */
+#define GNC_MIN_CYCLE_DT_S 0.01f
+#define GNC_MAX_CYCLE_DT_S 1.0f
 
 /*
 ** Event IDs
@@ -154,6 +145,8 @@
 #define GNC_APP_BAD_CTRL_EID      24  /* non-finite control output sanitized to coast */
 #define GNC_APP_TLM_LOSS_EID      25  /* telemetry loss exceeded timeout — auto-abort */
 #define GNC_APP_ANOMALY_EID       26  /* actuator authority anomaly (commanded burn underdelivering) */
+#define GNC_APP_BAD_DT_EID        27  /* SIM_STATE CycleDt_s out of range — cycle skipped */
+#define GNC_APP_LINK_INF_EID      28  /* sim link restored after a stale period            */
 
 /*
 ** Ground command function codes
@@ -218,41 +211,12 @@ typedef enum
 } GNC_Phase_t;
 
 /*
-** Unity telemetry packet — must match UdpTelemetrySender.cs BuildPacket() exactly.
-** 19 floats (76 bytes) + 1 int32 (4 bytes) = 80 bytes, little-endian.
-** __attribute__((packed)) prevents compiler from inserting any padding.
+** Vehicle state input: SIMLINK_SimState_t (sim_io/fsw/inc/simlink_icd.h),
+** delivered in SIM_IO_SimStateMsg_t. RelPos/RelVel are chaser-minus-target in
+** Unity world axes (+Y radial, -Z along-track, +X cross-track) — CW feedforward
+** input only; lateral control steers on the port-relative LatOffset_X/Y.
 */
-typedef struct __attribute__((packed))
-{
-    float MET_s;
-    float Range_m;
-    float ClosingSpeed_ms;
-    float LateralOffset_m;
-    float AttitudeError_deg;
-    float Pos_X;             /* chaser transform origin, world frame — CW feedforward
-                              ** input only. NOT docking-port-relative; do not use this
-                              ** for lateral control, see LatOffset_X/Y below.          */
-    float Pos_Y;
-    float Pos_Z;
-    float Vel_X;
-    float Vel_Y;
-    float Vel_Z;
-    float AngVel_X;
-    float AngVel_Y;
-    float AngVel_Z;
-    int32 Flags;            /* bit 0 = InCorridor, bit 1 = Docked */
-    float PitchError_deg;   /* per-axis attitude errors [-180, 180]; 0 = aligned */
-    float YawError_deg;
-    float RollError_deg;
-    float LatOffset_X;      /* docking-port-relative lateral offset, signed, in the
-                             ** target port's local right/up frame (meters) — what the
-                             ** lateral controller actually steers on. Unlike Pos_X/Y,
-                             ** this tracks the docking PORT (chaserPort), not the
-                             ** chaser's transform origin, so attitude changes that sweep
-                             ** the port sideways (moment arm from origin to port) are
-                             ** visible here even when the origin itself isn't moving. */
-    float LatOffset_Y;
-} GNC_APP_UnityTlm_t;
+typedef SIMLINK_SimState_t GNC_APP_UnityTlm_t;
 
 /*
 ** Housekeeping telemetry packet (published to SB each wakeup)
@@ -267,17 +231,15 @@ typedef struct
     uint32                    WakeupCount;
     uint32                    CmdCount;
     uint32                    CmdErrCount;
-    uint32                    UdpPacketsReceived;
+    uint32                    UdpPacketsReceived; /* SIM_STATE messages received (name kept for ground-tool offsets) */
     uint8                     Phase;     /* current GNC_Phase_t value (0=IDLE 1=CORRECT 2=APPROACH 3=DOCKED) */
     uint8                     Spare[3];  /* explicit alignment padding — do not reuse without updating tools */
     /* Phase 5D — LC watchpoint fields (offsets 32, 36, 40) */
     float                     ClosingSpeed_ms;   /* latest Unity closing speed; mirrored for LC overspeed WP */
     float                     LateralOffset_m;   /* latest Unity lateral offset; mirrored for LC corridor WP */
-    uint32                    TlmStaleSec;       /* consecutive stale wakeup cycles since last fresh Unity
-                                                  ** packet (despite the name, units are wakeup cycles, not
-                                                  ** literal seconds — multiply by GNC_CYCLE_DT_S). Drives the
-                                                  ** auto-abort watchdog in GNC_APP_ProcessWakeup since no LC
-                                                  ** instance is started for this target (see targets.cmake). */
+    uint32                    TlmStaleSec;       /* consecutive 1 Hz HK periods with no SIM_STATE from
+                                                  ** SIM_IO (now genuinely seconds of wall time). Drives the
+                                                  ** sim-link-loss auto-abort in GNC_APP_SendHk. */
     uint32                    ActuatorAnomalyCount; /* times the axial actuator-health monitor flagged a
                                                      ** commanded burn as significantly underdelivering        */
     /* Attitude — previously visible only in the (often line-truncated) EVS
@@ -321,17 +283,17 @@ typedef struct
     uint32             UnderDeliveryStreak; /* consecutive cycles where the observed axial Δv came in
                                              ** well under what PrevCtrlFz/PrevCtrlDuration_s predicted */
 
-    /* UDP receive thread and shared telemetry state */
-    osal_id_t          UdpTaskId;
-    osal_id_t          SocketId;
-    osal_id_t          TlmMutex;      /* guards LatestTlm and TlmFresh */
-    GNC_APP_UnityTlm_t LatestTlm;    /* most recent packet from Unity  */
-    bool               TlmFresh;     /* set by recv task, cleared by wakeup handler */
+    /* Latest vehicle state (single-task ownership — no mutex needed) */
+    GNC_APP_UnityTlm_t LatestTlm;          /* most recent SIM_STATE payload                 */
+    bool               HaveTlm;            /* at least one SIM_STATE received                */
+    bool               TlmSinceLastHk;     /* SIM_STATE seen since the previous 1 Hz HK tick */
+    bool               LinkLossLatched;    /* auto-abort fired for the current outage        */
 
-    /* UDP command socket (cFS → Unity) */
-    osal_id_t          CmdSocketId;
-    OS_SockAddr_t      CmdAddr;
-    bool               CmdSocketReady;
+    uint32             PrevSeq;            /* Seq of the previous SIM_STATE (continuity check) */
+    bool               HavePrevSeq;
+
+    /* Actuator command output (SB) */
+    SIM_IO_WrenchCmdMsg_t WrenchMsg;
 
     /* CFE_TBL parameter table */
     CFE_TBL_Handle_t        ParamTblHandle;
@@ -342,7 +304,7 @@ extern GNC_APP_Data_t GNC_APP_Data;
 
 /*
 ** Control output — mask of thrusters to fire plus how long to fire them.
-** Computed by GNC_APP_ComputeControl, encoded by GNC_APP_SendCommand.
+** Computed by GNC_APP_ComputeControl, published by GNC_APP_PublishCommand.
 */
 typedef struct
 {
@@ -356,13 +318,11 @@ typedef struct
 */
 void         GNC_APP_Main(void);
 CFE_Status_t GNC_APP_Init(void);
-void         GNC_APP_ProcessWakeup(void);
+void         GNC_APP_ProcessSimState(const SIM_IO_SimStateMsg_t *Msg);
+void         GNC_APP_SendHk(void);
 void         GNC_APP_ProcessCmd(CFE_SB_Buffer_t *MsgBuf);
-void         GNC_APP_UdpRecvTask(void);
-void         GNC_APP_OpenCmdSocket(void);
-/* Phase 6-5: takes the body-frame wrench directly — no bitmask conversion.
-** Packs Fx,Fy,Fz,Tx,Ty,Tz,duration,phase into a 32-byte UDP packet for Unity.
-** Unity's pseudo-inverse allocator maps the wrench to physical thrusters. */
-void         GNC_APP_SendCommand(const GNC_Control_t *ctrl);
+/* Publishes the body-frame wrench as SIM_IO_WRENCH_CMD_MID, tagged with the
+** Seq of the SIM_STATE it answers so Unity can release that lock-step cycle. */
+void         GNC_APP_PublishCommand(const GNC_Control_t *ctrl, uint32 Seq);
 
 #endif /* GNC_APP_H */

@@ -9,6 +9,7 @@ function (generate_cfs_startup_script CFS_INSTALL_DIR)
         "CFE_APP, ci_lab,      CI_LAB_AppMain,     CI_LAB,       40,   32768, 0x0, 0;\n"
         "CFE_APP, to_lab,      TO_LAB_AppMain,     TO_LAB,       45,   32768, 0x0, 0;\n"
         "CFE_APP, sample_app,  SAMPLE_APP_Main,    SAMPLE_APP,   50,   32768, 0x0, 0;\n"
+        "CFE_APP, sim_io,      SIM_IO_Main,        SIM_IO,       54,   32768, 0x0, 0;\n"
         "CFE_APP, gnc_app,     GNC_APP_Main,       GNC_APP,      55,   32768, 0x0, 0;\n"
     )
 
