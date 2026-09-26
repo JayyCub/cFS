@@ -11,7 +11,7 @@
 ** simulation or real avionics.
 **
 ** Task layout:
-**   main task  — SB pipe: WRENCH_CMD from GNC (-> UDP to Unity), SEND_HK, ground cmds
+**   main task  — SB pipe: THRUSTER_CMD from RCS (-> UDP to Unity), SEND_HK, ground cmds
 **   rx child   — blocks on the UDP socket, validates SimLink frames, publishes
 **                SIM_STATE to the SB (which in turn schedules GNC — lock-step)
 */
@@ -81,6 +81,6 @@ CFE_Status_t SIM_IO_Init(void);
 /* sim_io_link.c */
 void         SIM_IO_RxTask(void);
 CFE_Status_t SIM_IO_OpenTx(void);
-void         SIM_IO_SendWrenchCmd(const SIM_IO_WrenchCmdMsg_t *Msg);
+void         SIM_IO_SendThrusterCmd(const SIM_IO_ThrusterCmdMsg_t *Msg);
 
 #endif /* SIM_IO_H */

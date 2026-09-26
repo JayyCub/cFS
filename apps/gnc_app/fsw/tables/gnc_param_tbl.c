@@ -27,30 +27,14 @@ GNC_ParamTbl_t GNC_ParamTbl =
     /* Mirrors observed SpaceX Dragon docking profile: ~0.3 m/s outside the first
        hold point, dropping to ~0.1 m/s once past it and re-commanded to GO.      */
 
-    /* Physical model — must match Unity Inspector; see "Key Coupling
-       Constraints" in Docs/DEV_REFERENCE.md for the full list and both
-       locations that must stay in sync. */
-    .ThrusterForce   = 400.0f,  /* N per thruster — real Draco thruster          */
-    .VehicleMass     = 12000.0f, /* kg — updated 2026-07-11 to match the Unity chaser
-                                   Rigidbody (Scene2.unity ChaserVehicle), which was
-                                   changed from 4500 without updating this table —
-                                   see "Key Coupling Constraints" in Docs/DEV_REFERENCE.md. */
-    .RotAccel        = 0.012f,  /* rad/s² — re-measured 2026-07-11 via ThrusterDiagnostic.cs
-                                   (ThrusterDiagnostic_20260711_172942.log) against the new
-                                   12000 kg mass: avg of +Tx=0.0118, +Ty=0.0123 rad/s² (1.00s
-                                   burn). Roll (+Tz) measured ~2x higher (0.0244) — the control
-                                   law uses one RotAccel for all three axes, so this is
-                                   calibrated toward pitch/yaw (docking-alignment precision)
-                                   rather than roll.                                        */
-
-    /* Burn duration limits — scaled to the 5 Hz (0.2s) GNC_CYCLE_DT_S cycle.
-       MaxBurnDuration keeps the same ~95% margin the old 1 Hz values had
-       (0.95/1.0); MinBurnDuration is floored at one Unity physics tick
-       (Fixed Timestep = 0.02s) rather than scaled proportionally (0.2×0.05=
-       0.01s), since a shorter request can't resolve to anything finer than
-       one FixedUpdate step anyway. */
-    .MinBurnDuration = 0.020f,  /* s — shorter pulses are skipped (coast)        */
-    .MaxBurnDuration = 0.190f,  /* s — cap so burn ends before next 5 Hz tick    */
+    /* Vehicle mass properties — FSW's model of the chaser (Unity: Rigidbody mass
+       12000 kg; VehicleState solid-cylinder inertia, r = 2 m, l = 6 m):
+         pitch/yaw I = m(3r² + l²)/12 = 48000 kg·m²,  roll I = m r²/2 = 24000 kg·m²
+       The 2:1 pitch-to-roll ratio matches the old ThrusterDiagnostic measurement
+       (roll accelerated ~2x faster than pitch/yaw for the same torque), which the
+       single RotAccel constant this replaced could not represent. */
+    .VehicleMass     = 12000.0f,
+    .Inertia_kgm2    = { 48000.0f, 48000.0f, 24000.0f },
 
     /* Lateral position controller */
     .LatKp           = 0.02f,   /* lateral speed = KP × position error           */
@@ -187,25 +171,11 @@ GNC_ParamTbl_t GNC_ParamTbl =
     /* fires a correction every cycle; the correction couples back into lateral.  */
     /* With a 2° deadband, sub-2° perturbations coast rather than being fought.  */
 
-    /* Braking deceleration — empirically measured from actual Unity physics.
-    ** These are NOT computed from thrusterForce × Fz_sum / VehicleMass because the
-    ** binary on/off thruster model combined with the 1 Hz discrete loop produces an
-    ** effective acceleration roughly 0.55× the theoretical value.  The values below
-    ** were derived from flight telemetry: Δv / burn_time for known thruster groups.
-    **
-    ** To recalibrate: run cFS, observe a full-power 0.95 s brake burn in the log,
-    ** read Δv from consecutive cycle speed readings, compute Δv / 0.95.
-    ** If thrusterForce or scene geometry changes, re-measure rather than recompute.
-    **
-    ** Re-measured 2026-07-11 via ThrusterDiagnostic.cs against VehicleMass = 12000
-    ** (ThrusterDiagnostic_20260711_172942.log, 1.00s burns — body-frame log confirms
-    ** zero off-axis coupling on all three, so these are clean single-axis readings):
-    **   Hard  (T08-T15): dV.z = -0.1890 m/s over 1.00s = 0.189 m/s²
-    **   Light (T08-T11): dV.z = -0.1332 m/s over 1.00s = 0.133 m/s²
-    **   Approach (T04-T07): dV.z = +0.0313 m/s over 1.00s = 0.031 m/s² */
-    .BrakeAccel_Hard_mss  = 0.189f,   /* m/s² — T08-T15, all 8 brake thrusters      */
-    .BrakeAccel_Light_mss = 0.133f,   /* m/s² — T08-T11 only (Brake-Yaw group)      */
-    .ApproachAccel_mss    = 0.031f,   /* m/s² — T04-T07 approach group               */
+    /* Axial braking capability — guidance planning estimate for the hold-point
+    ** lookahead only (no longer sizes burns). 0.189 m/s² is the brake-group
+    ** deceleration last measured by ThrusterDiagnostic (2026-07-11, 1.0 s burn
+    ** on T08-T15 at 12000 kg). */
+    .AxialBrakeAccel_mss = 0.189f,
 
     /* Axial hold-position controller (HOLD phase) — same magnitude as LatKp/
     ** MaxLatSpeed; gentle enough not to fight the brake burn's own overshoot
@@ -213,9 +183,17 @@ GNC_ParamTbl_t GNC_ParamTbl =
     .AxialHoldKp     = 0.02f,   /* target closing speed = KP × range error (m/s per m) */
     .MaxHoldSpeed    = 0.05f,   /* cap on hold-correction closing speed (m/s)          */
 
-    /* ~10 missed 5 Hz cycles (GNC_CYCLE_DT_S) before GNC_APP_ProcessWakeup forces
-       an auto-abort — see doc comment in gnc_app_tbl.h. */
+    /* 2 s of wall time with no SIM_STATE before GNC_APP_SendHk forces an
+       auto-abort — see doc comment in gnc_app_tbl.h. */
     .TlmLossTimeoutSec = 2.0f,  /* s */
+
+    /* Crew manual flight (MANUAL phase). Full THC ≈ 240 N of net thrust at
+       12000 kg; full RHC = 1 °/s. The rate-hold deadband sits above the RCS
+       minimum angular impulse bit (~14 N·m·s ≈ 3e-4 rad/s in pitch/yaw, 6e-4 in
+       roll) so rate hold doesn't limit-cycle one impulse bit either side of 0. */
+    .ManualAccel_mss         = 0.02f,
+    .ManualRate_rads         = 0.0175f,
+    .ManualRateDeadband_rads = 0.0008f,
 };
 
 /*

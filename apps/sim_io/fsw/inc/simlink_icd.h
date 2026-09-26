@@ -14,18 +14,25 @@
 ** asserts below enforce it so the layout can't silently drift).
 **
 ** Lock-step: Unity sends one SIM_STATE frame per GNC cycle with an
-** incrementing Seq, then blocks until a WRENCH_CMD frame echoing that same
+** incrementing Seq, then blocks until a THRUSTER_CMD frame echoing that same
 ** Seq comes back. cFS is therefore scheduled by simulation time, not by a
 ** wall-clock timer, and every run with the same inputs is repeatable.
+**
+** v3 (realism phase 2): cFS now does thruster allocation and PWM itself, so
+** the command is per-thruster valve on-times, not a wrench; SIM_STATE carries
+** the crew hand-controller deflections so manual flight also goes through FSW.
 */
 
 #include "common_types.h"
 
 #define SIMLINK_SYNC_WORD 0x324B4C53u /* bytes 'S','L','K','2' on the wire (LE) */
-#define SIMLINK_VERSION   2u
+#define SIMLINK_VERSION   3u
 
-#define SIMLINK_TYPE_SIM_STATE  1u /* Unity -> cFS, once per GNC cycle            */
-#define SIMLINK_TYPE_WRENCH_CMD 2u /* cFS -> Unity, echoes the SIM_STATE Seq      */
+#define SIMLINK_TYPE_SIM_STATE    1u /* Unity -> cFS, once per GNC cycle            */
+#define SIMLINK_TYPE_THRUSTER_CMD 3u /* cFS -> Unity, echoes the SIM_STATE Seq      */
+                                     /* (type 2 = v2 WRENCH_CMD, retired)            */
+
+#define SIMLINK_NUM_THRUSTERS 16u
 
 #define SIMLINK_MAX_FRAME_BYTES 512u
 
@@ -79,29 +86,32 @@ typedef struct
     float  RollError_deg;
     float  LatOffset_X;       /* signed port lateral offset, world X/Y (m)             */
     float  LatOffset_Y;
+    float  Thc[3];            /* crew translation hand controller, body X/Y/Z, -1..+1  */
+    float  Rhc[3];            /* crew rotation hand controller, body X/Y/Z (pitch/yaw/
+                              ** roll), -1..+1                                          */
 } SIMLINK_SimState_t;
 
 /*
-** WRENCH_CMD payload (Phase 1: body-frame wrench + shared burn duration, allocated
-** to thrusters by Unity — Phase 2 replaces this with per-thruster on-times).
+** THRUSTER_CMD payload — valve on-times computed by the cFS RCS app (allocation +
+** PWM). Every thruster opens at the start of the cycle and closes after its own
+** on-time; Unity applies full rated thrust while open.
 */
 typedef struct
 {
-    float Fx, Fy, Fz;   /* body-frame force (N)    */
-    float Tx, Ty, Tz;   /* body-frame torque (N·m) */
-    float Duration_s;   /* burn duration, 0 = coast */
-    int32 GncPhase;     /* GNC_Phase_t, for HUD display */
-} SIMLINK_WrenchCmd_t;
+    uint32 NumThrusters;                     /* SIMLINK_NUM_THRUSTERS             */
+    int32  GncPhase;                         /* GNC_Phase_t, for HUD display      */
+    float  OnTime_s[SIMLINK_NUM_THRUSTERS];  /* 0 = closed this cycle             */
+} SIMLINK_ThrusterCmd_t;
 
 #define SIMLINK_SIM_STATE_FRAME_BYTES \
     (sizeof(SIMLINK_Header_t) + sizeof(SIMLINK_SimState_t) + sizeof(SIMLINK_Trailer_t))
-#define SIMLINK_WRENCH_CMD_FRAME_BYTES \
-    (sizeof(SIMLINK_Header_t) + sizeof(SIMLINK_WrenchCmd_t) + sizeof(SIMLINK_Trailer_t))
+#define SIMLINK_THRUSTER_CMD_FRAME_BYTES \
+    (sizeof(SIMLINK_Header_t) + sizeof(SIMLINK_ThrusterCmd_t) + sizeof(SIMLINK_Trailer_t))
 
 _Static_assert(sizeof(SIMLINK_Header_t) == 24, "SimLink header layout changed");
 _Static_assert(sizeof(SIMLINK_Trailer_t) == 4, "SimLink trailer layout changed");
-_Static_assert(sizeof(SIMLINK_SimState_t) == 80, "SimLink SIM_STATE layout changed");
-_Static_assert(sizeof(SIMLINK_WrenchCmd_t) == 32, "SimLink WRENCH_CMD layout changed");
+_Static_assert(sizeof(SIMLINK_SimState_t) == 104, "SimLink SIM_STATE layout changed");
+_Static_assert(sizeof(SIMLINK_ThrusterCmd_t) == 72, "SimLink THRUSTER_CMD layout changed");
 
 /* CRC-16/CCITT-FALSE: poly 0x1021, init 0xFFFF, no reflection, no final XOR. */
 static inline uint16 SIMLINK_Crc16(const uint8 *Data, uint32 Len)

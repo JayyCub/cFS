@@ -23,16 +23,21 @@ typedef struct
 } SIM_IO_SimStateMsg_t;
 
 /*
-** WRENCH_CMD — published by GNC each cycle in response to SIM_STATE.
-** SIM_IO forwards it to Unity tagged with Seq so Unity can release the step.
+** THRUSTER_CMD — published by the RCS app each cycle (GNC impulse request ->
+** allocation -> PWM). SIM_IO forwards Cmd to Unity tagged with Seq so Unity can
+** release the lock-step cycle. Achieved* is the impulse these on-times deliver
+** according to RCS's thruster table (after saturation scaling and minimum-
+** impulse-bit rounding) — what GNC should expect to see, not what it asked for.
 */
 typedef struct
 {
     CFE_MSG_TelemetryHeader_t TelemetryHeader;
     uint32                    Seq; /* Seq of the SIM_STATE this command answers */
     uint32                    Spare;
-    SIMLINK_WrenchCmd_t       Cmd;
-} SIM_IO_WrenchCmdMsg_t;
+    SIMLINK_ThrusterCmd_t     Cmd;
+    float                     AchievedLinImpulse_Ns[3];  /* body frame */
+    float                     AchievedAngImpulse_Nms[3]; /* body frame */
+} SIM_IO_ThrusterCmdMsg_t;
 
 /* Ground command codes */
 #define SIM_IO_NOOP_CC           0

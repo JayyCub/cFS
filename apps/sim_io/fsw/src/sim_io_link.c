@@ -197,11 +197,11 @@ CFE_Status_t SIM_IO_OpenTx(void)
 }
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
-/* Frame one GNC WRENCH_CMD and send it to Unity.                           */
+/* Frame one RCS THRUSTER_CMD and send it to Unity.                         */
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
-void SIM_IO_SendWrenchCmd(const SIM_IO_WrenchCmdMsg_t *Msg)
+void SIM_IO_SendThrusterCmd(const SIM_IO_ThrusterCmdMsg_t *Msg)
 {
-    uint8             Buf[SIMLINK_WRENCH_CMD_FRAME_BYTES];
+    uint8             Buf[SIMLINK_THRUSTER_CMD_FRAME_BYTES];
     SIMLINK_Header_t  Hdr;
     SIMLINK_Trailer_t Trl;
     uint32            LastSeq;
@@ -220,13 +220,13 @@ void SIM_IO_SendWrenchCmd(const SIM_IO_WrenchCmdMsg_t *Msg)
     OS_MutSemGive(SIM_IO_Data.LastRxMutex);
 
     /* Still forwarded — Unity discards it if it has moved on — but counted,
-    ** because in lock-step a stale answer means GNC fell behind. */
+    ** because in lock-step a stale answer means FSW (GNC -> RCS) fell behind. */
     if (Msg->Seq != LastSeq)
         SIM_IO_Data.HkTlm.TxStaleSeq++;
 
     Hdr.Sync      = SIMLINK_SYNC_WORD;
     Hdr.Version   = SIMLINK_VERSION;
-    Hdr.Type      = SIMLINK_TYPE_WRENCH_CMD;
+    Hdr.Type      = SIMLINK_TYPE_THRUSTER_CMD;
     Hdr.Seq       = Msg->Seq;
     Hdr.Length    = sizeof(Buf);
     Hdr.SimTime_s = (Msg->Seq == LastSeq) ? LastSimTime : 0.0;

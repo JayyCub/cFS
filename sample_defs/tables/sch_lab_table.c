@@ -68,6 +68,7 @@ SCH_LAB_ScheduleTable_t SCH_TBL_Structure =
                                                                       watchdog. The GNC control cycle runs
                                                                       lock-step on SIM_IO SIM_STATE, not here. */
         {CFE_SB_MSGID_WRAP_VALUE(0x1897),                 10, 0}, /* SIM_IO_SEND_HK_MID, 1 Hz */
+        {CFE_SB_MSGID_WRAP_VALUE(0x18A2),                 10, 0}, /* RCS_SEND_HK_MID, 1 Hz (also RCS table manage) */
         {CFE_SB_MSGID_WRAP_VALUE(CF_SEND_HK_MID),         56, 0}, /* every 5.6 seconds */
         {CFE_SB_MSGID_WRAP_VALUE(CF_WAKE_UP_MID),         1,  0}, /* every 0.1 seconds (example of 10 Hz packet) */
         {CFE_SB_MSGID_WRAP_VALUE(MD_SEND_HK_MID),         58, 0}, /* every 5.8 seconds */

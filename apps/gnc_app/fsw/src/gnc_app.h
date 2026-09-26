@@ -8,57 +8,44 @@
 #include "gnc_app_tbl.h"
 #include "sim_io_msgids.h"
 #include "sim_io_msg.h"
+#include "rcs_msgids.h"
+#include "rcs_msg.h"
 
 /*
 ** Pipe configuration
 **
-** GNC owns no sockets: vehicle state arrives as SIM_IO_SIM_STATE_MID and the
-** actuator command leaves as SIM_IO_WRENCH_CMD_MID, both on the Software Bus.
+** GNC owns no sockets and knows nothing about individual thrusters: vehicle
+** state arrives as SIM_IO_SIM_STATE_MID, and each cycle GNC publishes the
+** impulse it wants (RCS_ACT_REQ_MID) for the RCS app to allocate to thrusters.
 ** SIM_STATE arrival IS the control-cycle trigger (lock-step with the sim).
 */
 #define GNC_APP_PIPE_NAME  "GNC_CMD_PIPE"
 #define GNC_APP_PIPE_DEPTH 32
 
 /*
-** GNC controller gain defaults — documented here for reference.
+** GNC controller gain defaults — documented here for reference only.
 ** At runtime the control law reads from the loaded GNC_ParamTbl_t (gnc_app_tbl.h).
-** These #defines are used only by gnc_param_tbl.c to populate the default table.
 **
 ** AXIS CONVENTION (approach along world +Z, ship upright):
 **   Approach axis  : chaser body +Z = world +Z (transform.forward toward target)
-**                    bit 4 (+Z) closes range; bit 5 (-Z) brakes.
 **   Lateral X axis : body +X = world +X (transform.right, left-right)
-**                    bit 0 = +X force;  bit 1 = -X force
 **   Lateral Y axis : body +Y = world +Y (transform.up, up-down)
-**                    bit 2 = +Y force;  bit 3 = -Y force
 **
-** Vel_Z is the approach (axial) velocity — do NOT use it in the lateral channel.
-** True lateral drift axes are Vel_X (world X) and Vel_Y (world Y).
+** RelVel_Z is the approach (axial) velocity — do NOT use it in the lateral channel.
 **
-** BURN DURATION MODEL:
-**   Rather than holding a thruster ON for a full 1-second cycle (binary mode),
-**   the GNC computes a proportional burn duration each cycle:
-**       duration = delta_v_needed / thruster_accel
-**   Unity fires each commanded thruster for exactly that many seconds, then coasts.
-**   The minimum-burn threshold acts as the implicit dead-band: velocity errors
-**   too small to warrant a GNC_MIN_BURN_DURATION pulse are left to coast.
-**
-**   COUPLING WARNING: GNC_THRUSTER_FORCE and GNC_VEHICLE_MASS must always match
-**   the values set in the Unity Inspector (RCSModel.thrusterForce and the
-**   Rigidbody mass on the chaser GameObject).  If they drift the GNC will
-**   systematically under- or over-shoot every burn.
+** ACTUATOR MODEL (realism phase 2):
+**   GNC outputs the impulse to impart this cycle — P = m·Δv (N·s) and
+**   L = I·Δω (N·m·s), body frame. The RCS app turns that into per-thruster valve
+**   on-times from its own thruster table (allocation + PWM + minimum impulse
+**   bit). GNC needs only mass properties; thruster force, geometry and burn
+**   timing are no longer GNC parameters.
 */
 #define GNC_AXIAL_KP          0.02f   /* target closing speed = KP * range (m/s per m) */
 #define GNC_MIN_CLOSE_SPEED   0.02f   /* minimum approach speed (m/s) */
 #define GNC_MAX_CLOSE_SPEED   0.30f   /* maximum approach speed (m/s) */
 
-#define GNC_THRUSTER_FORCE    10.0f   /* N per thruster — must match RCSModel.thrusterForce */
-#define GNC_VEHICLE_MASS     200.0f   /* kg — must match Rigidbody mass in Unity inspector */
-#define GNC_ROT_ACCEL          0.30f  /* rad/s² per attitude thruster — tune to match Unity */
-#define GNC_RCS_MOMENT_ARM     1.5f   /* m — thruster pod radius used in mask→wrench conversion; must match Unity scene */
-
-#define GNC_MIN_BURN_DURATION  0.050f /* s — pulses shorter than this are skipped (coast) */
-#define GNC_MAX_BURN_DURATION  0.950f /* s — caps burn so thruster stops before next 1 Hz tick */
+/* Hand-controller deflection (either stick, any axis) that hands control to the crew */
+#define GNC_HC_TAKEOVER_THRESHOLD 0.5f
 
 /*
 ** Lateral position controller gains
@@ -147,6 +134,7 @@
 #define GNC_APP_ANOMALY_EID       26  /* actuator authority anomaly (commanded burn underdelivering) */
 #define GNC_APP_BAD_DT_EID        27  /* SIM_STATE CycleDt_s out of range — cycle skipped */
 #define GNC_APP_LINK_INF_EID      28  /* sim link restored after a stale period            */
+#define GNC_APP_MANUAL_INF_EID    29  /* crew hand-controller takeover                     */
 
 /*
 ** Ground command function codes
@@ -195,6 +183,10 @@ typedef struct { CFE_MSG_CommandHeader_t CmdHeader; } GNC_APP_AbortCmd_t;
 **   HOLD    — ground-commanded hold; station-keep (no axial closure).
 **             Entered only by GNC_APP_HOLD_CC. Released only by GNC_APP_GO_CC.
 **
+**   MANUAL  — crew flying on the hand controllers (THC accel command, RHC rate
+**             command with rate hold). Entered on any stick deflection from any
+**             undocked phase; released only by GO (-> CORRECT) or ABORT.
+**
 ** ABORT command sets IDLE + AbortLatch; all thrust inhibited until GO received.
 **
 ** Autonomous transitions (CORRECT ↔ APPROACH) are managed by GNC_APP_SelectPhase()
@@ -207,7 +199,8 @@ typedef enum
     GNC_PHASE_CORRECT  = 1,  /* lateral correction + axial station-keep */
     GNC_PHASE_APPROACH = 2,  /* final approach — axial + lateral hold   */
     GNC_PHASE_DOCKED   = 3,  /* docked — all thrust inhibited           */
-    GNC_PHASE_HOLD     = 4   /* ground-commanded hold — await GO        */
+    GNC_PHASE_HOLD     = 4,  /* ground-commanded hold — await GO        */
+    GNC_PHASE_MANUAL   = 5   /* crew hand-controller flight — await GO  */
 } GNC_Phase_t;
 
 /*
@@ -277,11 +270,11 @@ typedef struct
     ** this cycle, to catch a thruster-delivery regression (like the allocator
     ** under-delivery bug) automatically instead of relying on someone reading
     ** the EVS log. Observational only — see GNC_APP_CheckActuatorHealth. */
-    float              PrevCtrlFz;          /* previous cycle's commanded axial force (N)        */
-    float              PrevCtrlDuration_s;  /* previous cycle's burn duration (s); 0 = nothing to check */
-    float              PrevClosingSpeed_ms; /* ClosingSpeed_ms at the time PrevCtrlFz was computed */
+    float              PrevAchievedPz_Ns;   /* axial impulse RCS actually commanded last cycle (N·s) */
+    bool               PrevBurnValid;       /* PrevAchievedPz_Ns is valid for the previous Seq       */
+    float              PrevClosingSpeed_ms; /* ClosingSpeed_ms when that impulse was requested       */
     uint32             UnderDeliveryStreak; /* consecutive cycles where the observed axial Δv came in
-                                             ** well under what PrevCtrlFz/PrevCtrlDuration_s predicted */
+                                             ** well under what PrevAchievedPz_Ns predicted */
 
     /* Latest vehicle state (single-task ownership — no mutex needed) */
     GNC_APP_UnityTlm_t LatestTlm;          /* most recent SIM_STATE payload                 */
@@ -293,7 +286,7 @@ typedef struct
     bool               HavePrevSeq;
 
     /* Actuator command output (SB) */
-    SIM_IO_WrenchCmdMsg_t WrenchMsg;
+    RCS_ActReqMsg_t    ActReqMsg;
 
     /* CFE_TBL parameter table */
     CFE_TBL_Handle_t        ParamTblHandle;
@@ -303,14 +296,13 @@ typedef struct
 extern GNC_APP_Data_t GNC_APP_Data;
 
 /*
-** Control output — mask of thrusters to fire plus how long to fire them.
+** Control output — impulse to impart this cycle, body frame (realism phase 2).
 ** Computed by GNC_APP_ComputeControl, published by GNC_APP_PublishCommand.
 */
 typedef struct
 {
-    float Fx, Fy, Fz;   /* body-frame force  (N)   — positive = +axis direction */
-    float Tx, Ty, Tz;   /* body-frame torque (N·m) — positive = +axis direction */
-    float duration_s;    /* seconds each fired thruster fires; 0.0 = coast        */
+    float Px, Py, Pz;   /* linear impulse  (N·s)   = VehicleMass × Δv          */
+    float Lx, Ly, Lz;   /* angular impulse (N·m·s) = Inertia × Δω per axis     */
 } GNC_Control_t;
 
 /*
@@ -321,7 +313,7 @@ CFE_Status_t GNC_APP_Init(void);
 void         GNC_APP_ProcessSimState(const SIM_IO_SimStateMsg_t *Msg);
 void         GNC_APP_SendHk(void);
 void         GNC_APP_ProcessCmd(CFE_SB_Buffer_t *MsgBuf);
-/* Publishes the body-frame wrench as SIM_IO_WRENCH_CMD_MID, tagged with the
+/* Publishes the impulse request as RCS_ACT_REQ_MID, tagged with the
 ** Seq of the SIM_STATE it answers so Unity can release that lock-step cycle. */
 void         GNC_APP_PublishCommand(const GNC_Control_t *ctrl, uint32 Seq);
 

@@ -117,7 +117,7 @@ CFE_Status_t SIM_IO_Init(void)
     if (Status == CFE_SUCCESS)
         Status = CFE_SB_Subscribe(CFE_SB_ValueToMsgId(SIM_IO_SEND_HK_MID), SIM_IO_Data.CmdPipe);
     if (Status == CFE_SUCCESS)
-        Status = CFE_SB_Subscribe(CFE_SB_ValueToMsgId(SIM_IO_WRENCH_CMD_MID), SIM_IO_Data.CmdPipe);
+        Status = CFE_SB_Subscribe(CFE_SB_ValueToMsgId(SIM_IO_THRUSTER_CMD_MID), SIM_IO_Data.CmdPipe);
     if (Status != CFE_SUCCESS)
     {
         CFE_EVS_SendEvent(SIM_IO_PIPE_ERR_EID, CFE_EVS_EventType_ERROR,
@@ -194,9 +194,9 @@ void SIM_IO_Main(void)
         CFE_MSG_GetMsgId(&BufPtr->Msg, &MsgId);
         switch (CFE_SB_MsgIdToValue(MsgId))
         {
-            case SIM_IO_WRENCH_CMD_MID:
-                if (SIM_IO_VerifyLength(&BufPtr->Msg, sizeof(SIM_IO_WrenchCmdMsg_t)))
-                    SIM_IO_SendWrenchCmd((const SIM_IO_WrenchCmdMsg_t *)BufPtr);
+            case SIM_IO_THRUSTER_CMD_MID:
+                if (SIM_IO_VerifyLength(&BufPtr->Msg, sizeof(SIM_IO_ThrusterCmdMsg_t)))
+                    SIM_IO_SendThrusterCmd((const SIM_IO_ThrusterCmdMsg_t *)BufPtr);
                 else
                     SIM_IO_Data.HkTlm.TxErrors++;
                 break;

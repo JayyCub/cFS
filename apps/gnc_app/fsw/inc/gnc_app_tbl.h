@@ -19,13 +19,13 @@
 ** The table service validates the incoming image, then swaps it in on the next
 ** GNC wakeup cycle.  This is the standard cFS mechanism for on-orbit gain tuning.
 **
-** COUPLING WARNING: ThrusterForce and VehicleMass must always match the values
-** set in the Unity Inspector (RCSModel.thrusterForce and Rigidbody mass).
-** If they drift, every burn duration will be systematically wrong. See "Key
-** Coupling Constraints" in Docs/DEV_REFERENCE.md for the full list of values
-** that must stay in sync between this table and the Unity scripts.
+** VehicleMass / Inertia_kgm2 are flight software's MODEL of the vehicle. If they
+** differ from the Unity Rigidbody (the "real" vehicle) the controller simply
+** over/under-corrects a little and closes the loop next cycle — a realistic
+** mass-property uncertainty, not a coupling bug. Thruster data lives in the
+** RCS app's table (rcs_thr_tbl.c), not here.
 **
-** Layout: 34 × float = 136 bytes. Naturally 4-byte aligned; no padding required.
+** Layout: all 4-byte floats, naturally aligned; no padding required.
 */
 typedef struct
 {
@@ -40,17 +40,13 @@ typedef struct
                                 ** slower, more cautious speed once inside the first hold point. */
 
     /*
-    ** Physical model — must match Unity Inspector values exactly
+    ** Vehicle mass properties — FSW's model of the vehicle, used to turn the
+    ** control law's Δv/Δω into impulse requests (P = m·Δv, L = I·Δω).
+    ** Thruster force, geometry and burn timing live in the RCS app's table.
     */
-    float ThrusterForce;    /* N per thruster                                   */
     float VehicleMass;      /* kg                                               */
-    float RotAccel;         /* rad/s² per attitude thruster                     */
-
-    /*
-    ** Burn duration limits
-    */
-    float MinBurnDuration;  /* s — pulses shorter than this coast (dead-band)   */
-    float MaxBurnDuration;  /* s — cap so thruster stops before next GNC wakeup */
+    float Inertia_kgm2[3];  /* principal inertia about body X (pitch), Y (yaw),
+                            ** Z (roll), kg·m²                                  */
 
     /*
     ** Lateral position controller
@@ -223,25 +219,11 @@ typedef struct
     float LatVelDeadband_Approach_ms; /* m/s — APPROACH phase deadband (looser) */
 
     /*
-    ** Braking deceleration constants — calibrated to actual Unity thruster geometry.
-    **
-    ** T00-T03 are excluded from docking; T04-T07 are approach-only (+Z).
-    ** The docking brake thrusters are split into two groups:
-    **   Light: T08-T11 (Brake-Yaw group)  — total -Z force ≈ 27.8 N at thrusterForce=10
-    **   Hard:  T08-T15 (both brake groups) — total -Z force ≈ 57.8 N at thrusterForce=10
-    **
-    ** These accel values are used by SelectPhase (brake distance lookahead) and
-    ** ComputeControl (HOLD axial braking).  They must match the Unity sim geometry —
-    ** if thrusterForce or thruster positions change, recalibrate by summing the
-    ** -Z components of the relevant group and dividing by VehicleMass.
-    **
-    ** Unity (RCSModel.SoftBrakeThreshold_N = 938 N) selects group by |Fz|:
-    **   |Fz| < 938 N  →  light brake (T08-T11 only)  [BrakeAccel_Light_mss × mass = 612 N]
-    **   |Fz| ≥ 938 N  →  hard brake  (T08-T15)        [BrakeAccel_Hard_mss  × mass = 1265 N]
+    ** Axial braking capability — a GUIDANCE PLANNING estimate only, used by the
+    ** hold-point lookahead (braking distance v²/a). It does not size any burn:
+    ** the RCS app computes on-times from its thruster table.
     */
-    float BrakeAccel_Hard_mss;  /* m/s² — deceleration from T08-T15 (hard stop)         */
-    float BrakeAccel_Light_mss; /* m/s² — deceleration from T08-T11 only (soft correct)  */
-    float ApproachAccel_mss;    /* m/s² — actual acceleration from approach group T04-T07  */
+    float AxialBrakeAccel_mss;  /* m/s² — sustained axial deceleration the RCS can deliver */
 
     /*
     ** Axial hold-position controller (HOLD phase only)
@@ -255,14 +237,23 @@ typedef struct
 
     /*
     ** Telemetry-loss watchdog.
-    ** If no fresh Unity telemetry packet arrives for this many seconds, GNC_APP
-    ** forces IDLE + AbortLatch (same effect as a ground ABORT command) rather
-    ** than continuing to coast silently. This exists because the field this
-    ** watchdog reads (HkTlm.TlmStaleSec) was originally scoped as an LC
-    ** watchpoint, but LC_APP is not part of this target's app list — see
-    ** GNC_APP_ProcessWakeup for the actual check.
+    ** If no SIM_STATE arrives for this many seconds (checked on the 1 Hz HK
+    ** tick, GNC_APP_SendHk), GNC_APP forces IDLE + AbortLatch (same effect as a
+    ** ground ABORT command) rather than resuming blindly when the link returns.
     */
     float TlmLossTimeoutSec; /* s — consecutive telemetry loss before auto-abort */
+
+    /*
+    ** Crew manual flight (MANUAL phase, hand controllers).
+    **   THC: acceleration command — ManualAccel_mss × deflection while held.
+    **   RHC: rate command with rate hold — target rate ManualRate_rads ×
+    **        deflection; stick released = hold zero rate. Rate errors below
+    **        ManualRateDeadband_rads are ignored so the minimum impulse bit
+    **        doesn't chatter back and forth around zero.
+    */
+    float ManualAccel_mss;         /* m/s² at full THC deflection            */
+    float ManualRate_rads;         /* rad/s at full RHC deflection           */
+    float ManualRateDeadband_rads; /* rad/s — rate-hold deadband             */
 
 } GNC_ParamTbl_t;
 

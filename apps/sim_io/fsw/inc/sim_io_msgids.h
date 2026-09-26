@@ -6,9 +6,9 @@
 **
 ** Topic allocation for the docking mission apps:
 **   0x93-0x95  gnc_app
-**   0x96-0x98  sim_io   (0x98 = GNC actuator command, published by gnc_app and
-**                        consumed here — the "vehicle actuator interface")
-**   0x99       reserved for the RCS/actuator-management app (realism roadmap phase 2)
+**   0x96-0x98  sim_io   (0x98 = THRUSTER_CMD, published by the rcs app and
+**                        consumed here — the "valve driver interface")
+**   0x99,0xA2  rcs      (see rcs_msgids.h)
 */
 
 /* Commands / scheduling received by sim_io */
@@ -19,7 +19,8 @@
 #define SIM_IO_HK_TLM_MID    0x0896 /* housekeeping                                     */
 #define SIM_IO_SIM_STATE_MID 0x0897 /* one per Unity GNC cycle — also the GNC wakeup    */
 
-/* Published by gnc_app, consumed by sim_io and forwarded to Unity */
-#define SIM_IO_WRENCH_CMD_MID 0x0898
+/* Published by the rcs app, consumed by sim_io (forwarded to Unity) and by
+** gnc_app (actuator-health check against the impulse actually commanded) */
+#define SIM_IO_THRUSTER_CMD_MID 0x0898
 
 #endif /* SIM_IO_MSGIDS_H */
