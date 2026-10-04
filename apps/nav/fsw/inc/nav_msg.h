@@ -62,6 +62,8 @@ typedef struct
     float                     PosSigma_m;      /* largest position 1-sigma (m)                 */
     float                     VelSigma_ms;     /* largest velocity 1-sigma (m/s)               */
     float                     AttSigma_rad;    /* largest attitude 1-sigma (rad)               */
+    float                     DockFrameQuat_L[4]; /* q_L_D: docking frame axes in LVLH (table
+                                               ** geometry; GNC rotates its commands with it)  */
     float                     Spare2;
 } NAV_SolutionMsg_t;
 
@@ -87,7 +89,7 @@ typedef struct
     uint32                    AttRejected;       /* attitude fixes that failed the gate           */
 } NAV_HkTlm_t;
 
-_Static_assert(sizeof(NAV_SolutionMsg_t) == 168, "NAV SOLUTION layout changed - update LC WDT and ground tools");
+_Static_assert(sizeof(NAV_SolutionMsg_t) == 184, "NAV SOLUTION layout changed - update LC WDT and ground tools");
 _Static_assert(offsetof(NAV_SolutionMsg_t, SimTime_s) == 16, "NAV SOLUTION layout changed - update ground tools");
 _Static_assert(sizeof(NAV_HkTlm_t) == 96, "NAV HK layout changed - update ground tools");
 

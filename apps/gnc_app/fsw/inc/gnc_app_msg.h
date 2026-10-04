@@ -22,7 +22,8 @@
 ** RESET_COUNTERS  — zero CmdCount, CmdErrCount, SimStateCount.
 ** HOLD            — immediately enter HOLD phase (station-keep, await GO).
 ** GO              — release HOLD, MANUAL or the ABORT latch; resume at CORRECT.
-** ABORT           — inhibit all thrust immediately; latch IDLE until GO.
+** ABORT           — collision-avoidance manoeuvre (DEPART: retreat until the
+**                   free drift is passively safe), then IDLE; latched until GO.
 **
 ** HOLD and ABORT are also what the SC fault-response RTSs send
 ** (sample_defs/cpu1/tables/sc_rts00N.c), so FDIR and ground drive the same paths.
@@ -45,6 +46,7 @@ typedef struct
 #define GNC_APP_PHASE_DOCKED   3
 #define GNC_APP_PHASE_HOLD     4
 #define GNC_APP_PHASE_MANUAL   5
+#define GNC_APP_PHASE_DEPART   6 /* abort: collision-avoidance manoeuvre in progress */
 
 /* Flags bits in HK and STATE */
 #define GNC_APP_FLAG_ABORT_LATCH   0x01u /* ABORT latched — guidance inhibited until GO    */
@@ -107,10 +109,18 @@ typedef struct
     float                     RelVel_ms[3];
     float                     LinImpulseReq_Ns[3]; /* impulse requested from RCS this cycle (body)    */
     float                     AngImpulseReq_Nms[3];
+    uint16                    OverspeedStreak;     /* cycles above the approach envelope (LC -> HOLD) */
+    uint16                    CorridorStreak;      /* cycles outside the cone inside CorridorCheckRange_m
+                                                   ** (LC -> ABORT)                                   */
+    float                     DriftSafeRange_m;    /* closest the port would come to the target port in
+                                                   ** free drift, PassiveSafeStart_s..Horizon_s from
+                                                   ** now (CW prediction; 0 if NAV invalid)           */
+    float                     CamDv_ms;            /* DEPART: retreat Δv delivered so far             */
+    float                     Spare2;
 } GNC_APP_StateTlm_t;
 
 _Static_assert(sizeof(GNC_APP_HkTlm_t) == 40, "GNC HK layout changed - update LC WDT and ground tools");
-_Static_assert(sizeof(GNC_APP_StateTlm_t) == 128, "GNC STATE layout changed - update LC WDT and ground tools");
+_Static_assert(sizeof(GNC_APP_StateTlm_t) == 144, "GNC STATE layout changed - update LC WDT and ground tools");
 _Static_assert(offsetof(GNC_APP_StateTlm_t, SimTime_s) == 16, "GNC STATE layout changed - update ground tools");
 
 #endif /* GNC_APP_MSG_H */

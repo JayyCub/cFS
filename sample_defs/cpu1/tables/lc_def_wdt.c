@@ -132,9 +132,31 @@ LC_WDTEntry_t LC_WDT[LC_MAX_WATCHPOINTS] = {
         .ComparisonValue.Unsigned16 = 5,
     },
 
-    /* #7 .. #175: unused */
-    LC_WDT_UNUSED,
-    LC_WDT_UNUSED,
+    /* #7: GNC STATE: >= 5 cycles above the approach envelope (closing speed vs range) */
+    {
+        .DataType                   = LC_DATA_WATCH_UWORD_LE,
+        .OperatorID                 = LC_OPER_GE,
+        .MessageID                  = CFE_SB_MSGID_WRAP_VALUE(GNC_APP_STATE_TLM_MID),
+        .WatchpointOffset           = offsetof(GNC_APP_StateTlm_t, OverspeedStreak),
+        .BitMask                    = LC_BITMASK_NONE,
+        .CustomFuncArgument         = 0,
+        .ResultAgeWhenStale         = 0,
+        .ComparisonValue.Unsigned16 = 5,
+    },
+
+    /* #8: GNC STATE: >= 5 cycles outside the approach cone inside CorridorCheckRange_m */
+    {
+        .DataType                   = LC_DATA_WATCH_UWORD_LE,
+        .OperatorID                 = LC_OPER_GE,
+        .MessageID                  = CFE_SB_MSGID_WRAP_VALUE(GNC_APP_STATE_TLM_MID),
+        .WatchpointOffset           = offsetof(GNC_APP_StateTlm_t, CorridorStreak),
+        .BitMask                    = LC_BITMASK_NONE,
+        .CustomFuncArgument         = 0,
+        .ResultAgeWhenStale         = 0,
+        .ComparisonValue.Unsigned16 = 5,
+    },
+
+    /* #9 .. #175: unused */
     LC_WDT_UNUSED,
     LC_WDT_UNUSED,
     LC_WDT_UNUSED,

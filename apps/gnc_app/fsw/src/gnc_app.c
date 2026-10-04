@@ -49,19 +49,10 @@ void GNC_APP_Main(void)
             }
             case SIM_IO_THRUSTER_CMD_MID:
             {
-                /* RCS's answer to our last ACT_REQ: remember the axial impulse
-                ** it really commanded, for next cycle's actuator-health check. */
                 size_t Size = 0;
                 CFE_MSG_GetSize(&MsgBuf->Msg, &Size);
                 if (Size == sizeof(SIM_IO_ThrusterCmdMsg_t))
-                {
-                    const SIM_IO_ThrusterCmdMsg_t *t = (const SIM_IO_ThrusterCmdMsg_t *)MsgBuf;
-                    if (GNC_APP_Data.HavePrevSeq && t->Seq == GNC_APP_Data.PrevSeq)
-                    {
-                        GNC_APP_Data.PrevAchievedPz_Ns = t->AchievedLinImpulse_Ns[2];
-                        GNC_APP_Data.PrevBurnValid     = true;
-                    }
-                }
+                    GNC_APP_ProcessThrusterCmd((const SIM_IO_ThrusterCmdMsg_t *)MsgBuf);
                 break;
             }
             case GNC_APP_SEND_HK_MID:
@@ -137,6 +128,40 @@ static int32 GNC_APP_ValidateParamTbl(void *TblPtr)
         CFE_EVS_SendEvent(GNC_APP_TBL_VAL_ERR_EID, CFE_EVS_EventType_ERROR,
                           "GNC_APP: table rejected — LatVelAtPort %lu is not 0 or 1",
                           (unsigned long)p->LatVelAtPort);
+        return GNC_APP_TBL_VALIDATE_ERR;
+    }
+    if (p->ProfileCount < 1 || p->ProfileCount > GNC_PROFILE_MAX)
+    {
+        CFE_EVS_SendEvent(GNC_APP_TBL_VAL_ERR_EID, CFE_EVS_EventType_ERROR,
+                          "GNC_APP: table rejected — ProfileCount %lu outside 1..%d",
+                          (unsigned long)p->ProfileCount, GNC_PROFILE_MAX);
+        return GNC_APP_TBL_VALIDATE_ERR;
+    }
+    {
+        uint32 i;
+        for (i = 0; i < p->ProfileCount; i++)
+        {
+            if (!(p->ProfileMaxClose_ms[i] > 0.0f) || (i > 0 && !(p->ProfileRange_m[i] > p->ProfileRange_m[i - 1])))
+            {
+                CFE_EVS_SendEvent(GNC_APP_TBL_VAL_ERR_EID, CFE_EVS_EventType_ERROR,
+                                  "GNC_APP: table rejected — approach profile point %lu (ranges must ascend, "
+                                  "speeds be positive)", (unsigned long)i);
+                return GNC_APP_TBL_VALIDATE_ERR;
+            }
+        }
+    }
+    if (!(p->AttCtrlAccel_rads2 > 0.0f) || !(p->AttRateDeadband_rads >= 0.0f) || !(p->FfReleaseDv_ms > 0.0f) ||
+        !(p->ProfileGuideFrac > 0.0f && p->ProfileGuideFrac <= 1.0f))
+    {
+        CFE_EVS_SendEvent(GNC_APP_TBL_VAL_ERR_EID, CFE_EVS_EventType_ERROR,
+                          "GNC_APP: table rejected — attitude accel / rate deadband / ff release / guide fraction");
+        return GNC_APP_TBL_VALIDATE_ERR;
+    }
+    if (!(p->CamDeltaV_ms > 0.0f) || !(p->CamMaxDeltaV_ms >= p->CamDeltaV_ms) ||
+        !(p->PassiveSafeStart_s >= 0.0f) || !(p->PassiveSafeHorizon_s > p->PassiveSafeStart_s))
+    {
+        CFE_EVS_SendEvent(GNC_APP_TBL_VAL_ERR_EID, CFE_EVS_EventType_ERROR,
+                          "GNC_APP: table rejected — abort manoeuvre / passive-safety parameters");
         return GNC_APP_TBL_VALIDATE_ERR;
     }
 
@@ -295,7 +320,7 @@ CFE_Status_t GNC_APP_Init(void)
 /* always operates on a consistent, up-to-date phase value.                  */
 /*                                                                           */
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
-static GNC_Phase_t GNC_APP_SelectPhase(const GNC_APP_Input_t *tlm, GNC_Phase_t current)
+static GNC_Phase_t GNC_APP_SelectPhase(const GNC_APP_Input_t *tlm, GNC_Phase_t current, float dt)
 {
     /* Docked check is unconditional — highest priority inhibit. The capture
     ** latch switch is a mechanism sensor, not a navigation estimate. */
@@ -326,6 +351,14 @@ static GNC_Phase_t GNC_APP_SelectPhase(const GNC_APP_Input_t *tlm, GNC_Phase_t c
             }
         }
     }
+
+    /*
+    ** DEPART (the abort manoeuvre) runs to completion: GNC_APP_ProcessNavSolution
+    ** ends it once the retreat is done and the free drift is passively safe.
+    ** Only the crew (above) can take it over.
+    */
+    if (current == GNC_PHASE_DEPART)
+        return GNC_PHASE_DEPART;
 
     /*
     ** HOLD is sticky — only ground GO or ABORT commands release it.
@@ -447,17 +480,13 @@ static GNC_Phase_t GNC_APP_SelectPhase(const GNC_APP_Input_t *tlm, GNC_Phase_t c
     {
         const GNC_ParamTbl_t *p     = GNC_APP_Data.ParamTblPtr;
         float                 v     = (tlm->ClosingSpeed_ms > 0.0f) ? tlm->ClosingSpeed_ms : 0.0f;
-        /* Distance needed to brake to a stop from current closing speed.
-        ** AxialBrakeAccel_mss is a guidance-planning estimate of the axial
-        ** deceleration the RCS can sustain (not used to size burns — the RCS
-        ** app does that from its thruster table). The continuous-thrust formula is v²/(2a); at the old 1 Hz cadence the
-        ** discrete loop only achieved roughly half that in practice (cycle-miss +
-        ** 0.95s burn cap), so empirically v²/a was used instead. That derating was
-        ** calibrated for a 1 Hz cycle — now that the cycle is 0.2s (5 Hz),
-        ** cycle-miss loss should be much smaller and this formula is likely too
-        ** conservative (braking earlier than necessary). Left as v²/a pending a
-        ** real test run to recalibrate against actual 5 Hz braking distance. */
-        float brake_dist = (v * v) / p->AxialBrakeAccel_mss;
+        /* Distance needed to brake to a stop from the current closing speed:
+        ** v²/(2a) at AxialBrakeAccel_mss — a guidance-planning estimate of the
+        ** axial deceleration the RCS can sustain (it sizes no burns; the RCS app
+        ** does that from its thruster table) — plus two cycles of travel for the
+        ** decision and the first pulse. Realism phase 5; the 1 Hz-era empirical
+        ** v²/a braked early (twice the distance) at today's 5 Hz cycle. */
+        float brake_dist = (v * v) / (2.0f * p->AxialBrakeAccel_mss) + 2.0f * v * dt;
 
         if (GNC_APP_Data.HoldPt1Armed && p->HoldPoint1_m > 0.0f &&
             tlm->Range_m <= p->HoldPoint1_m + brake_dist)
@@ -487,16 +516,133 @@ static GNC_Phase_t GNC_APP_SelectPhase(const GNC_APP_Input_t *tlm, GNC_Phase_t c
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 /*                                                                           */
+/* Small quaternion helpers (x, y, z, w; Hamilton product, v' = q v q*) —    */
+/* the same conventions as NAV and Unity.                                    */
+/*                                                                           */
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+static void GNC_QuatRotate(const float q[4], const float v[3], float out[3])
+{
+    float t[3], ut[3];
+    t[0]  = 2.0f * (q[1] * v[2] - q[2] * v[1]);
+    t[1]  = 2.0f * (q[2] * v[0] - q[0] * v[2]);
+    t[2]  = 2.0f * (q[0] * v[1] - q[1] * v[0]);
+    ut[0] = q[1] * t[2] - q[2] * t[1];
+    ut[1] = q[2] * t[0] - q[0] * t[2];
+    ut[2] = q[0] * t[1] - q[1] * t[0];
+    out[0] = v[0] + q[3] * t[0] + ut[0];
+    out[1] = v[1] + q[3] * t[1] + ut[1];
+    out[2] = v[2] + q[3] * t[2] + ut[2];
+}
+
+static void GNC_QuatConj(const float q[4], float out[4])
+{
+    out[0] = -q[0];
+    out[1] = -q[1];
+    out[2] = -q[2];
+    out[3] = q[3];
+}
+
+/* Docking-frame vector -> body frame: v_B = q_B_L q_L_D v_D */
+static void GNC_DockToBody(const GNC_APP_Input_t *tlm, const float v_D[3], float v_B[3])
+{
+    float v_L[3], q_B_L[4];
+    GNC_QuatRotate(tlm->DockQuat_L, v_D, v_L);
+    GNC_QuatConj(tlm->AttQuat_L, q_B_L);
+    GNC_QuatRotate(q_B_L, v_L, v_B);
+}
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+/*                                                                           */
+/* GNC_APP_ProfileLimit — approach envelope: max closing speed at a range    */
+/* (piecewise linear between the table breakpoints, flat beyond the ends)    */
+/*                                                                           */
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+static float GNC_APP_ProfileLimit(float range, const GNC_ParamTbl_t *p)
+{
+    uint32 i, n = p->ProfileCount;
+
+    if (range <= p->ProfileRange_m[0])
+        return p->ProfileMaxClose_ms[0];
+    for (i = 1; i < n; i++)
+    {
+        if (range <= p->ProfileRange_m[i])
+        {
+            float f = (range - p->ProfileRange_m[i - 1]) / (p->ProfileRange_m[i] - p->ProfileRange_m[i - 1]);
+            return p->ProfileMaxClose_ms[i - 1] + f * (p->ProfileMaxClose_ms[i] - p->ProfileMaxClose_ms[i - 1]);
+        }
+    }
+    return p->ProfileMaxClose_ms[n - 1];
+}
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+/*                                                                           */
+/* GNC_APP_DriftSafeRange — passive-safety check                             */
+/*                                                                           */
+/* Where would the docking port go if every thruster stopped now? Closed-    */
+/* form Clohessy-Wiltshire (Hill) free drift from NAV's CoM state, attitude  */
+/* held, sampled every GNC_DRIFT_STEP_S between PassiveSafeStart_s and       */
+/* PassiveSafeHorizon_s. Returns the closest approach of the chaser port to  */
+/* the target port over that window (0 if NAV can't support the estimate).  */
+/*   LVLH (Hill) x radial = +Y world, y along-track = -Z world,              */
+/*               z cross-track = +X world                                    */
+/*   x(t) = (4-3c)x0 + (s/n)vx0 + (2/n)(1-c)vy0                              */
+/*   y(t) = 6(s-nt)x0 + y0 - (2/n)(1-c)vx0 + ((4s-3nt)/n)vy0                 */
+/*   z(t) = c z0 + (s/n)vz0               (s = sin nt, c = cos nt)           */
+/*                                                                           */
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+static float GNC_APP_DriftSafeRange(const GNC_APP_Input_t *tlm, const GNC_ParamTbl_t *p)
+{
+    const double n = GNC_CW_MEAN_MOTION;
+    double       x0, y0, z0, vx, vy, vz, off[3], best = 1e30, t;
+    float        port_L[3];
+    int          i;
+
+    if (!tlm->RelNavValid || !tlm->AttValid)
+        return 0.0f;
+
+    /* port relative to the target port = CoM drift + this fixed offset */
+    GNC_QuatRotate(tlm->DockQuat_L, tlm->PortPos_D, port_L);
+    off[0] = (double)port_L[0] - tlm->RelPos_X;
+    off[1] = (double)port_L[1] - tlm->RelPos_Y;
+    off[2] = (double)port_L[2] - tlm->RelPos_Z;
+
+    x0 = tlm->RelPos_Y;
+    y0 = -tlm->RelPos_Z;
+    z0 = tlm->RelPos_X;
+    vx = tlm->RelVel_Y;
+    vy = -tlm->RelVel_Z;
+    vz = tlm->RelVel_X;
+
+    for (t = p->PassiveSafeStart_s; t <= p->PassiveSafeHorizon_s; t += GNC_DRIFT_STEP_S)
+    {
+        double nt = n * t, sn = sin(nt), cn = cos(nt), x, y, z, w[3], d2 = 0.0;
+        x    = (4.0 - 3.0 * cn) * x0 + (sn / n) * vx + (2.0 / n) * (1.0 - cn) * vy;
+        y    = 6.0 * (sn - nt) * x0 + y0 - (2.0 / n) * (1.0 - cn) * vx + ((4.0 * sn - 3.0 * nt) / n) * vy;
+        z    = cn * z0 + (sn / n) * vz;
+        w[0] = z;
+        w[1] = x;
+        w[2] = -y;
+        for (i = 0; i < 3; i++)
+            d2 += (w[i] + off[i]) * (w[i] + off[i]);
+        if (d2 < best)
+            best = d2;
+    }
+    return (float)sqrt(best);
+}
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+/*                                                                           */
 /* GNC_APP_LateralAxis — velocity change wanted on one lateral axis          */
 /*                                                                           */
 /* Target velocity from continuous position feedback (gain differs by        */
-/* phase — gentler in APPROACH), minus current velocity, plus CW             */
-/* feedforward. Inside the velocity deadband the axis coasts; outside it,   */
-/* the request is the part of the error beyond the deadband (the same Δv    */
-/* the old bang/duration law delivered, now stated directly).               */
+/* phase — gentler in APPROACH), minus current velocity. Inside the velocity */
+/* deadband the axis coasts; outside it, the request is the part of the      */
+/* error beyond the deadband. The CW feed-forward is no longer folded in     */
+/* here (phase 5): it is accumulated and released on its own in             */
+/* ComputeControl, so the deadband can't swallow it.                         */
 /*                                                                           */
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
-static float GNC_APP_LateralAxis(float pos, float vel, float ff, GNC_Phase_t phase, const GNC_ParamTbl_t *p)
+static float GNC_APP_LateralAxis(float pos, float vel, GNC_Phase_t phase, const GNC_ParamTbl_t *p)
 {
     /* Both phases actively hold the centerline — APPROACH uses a gentler gain
     ** (LatKp_Approach) and a looser velocity deadband so it coasts through
@@ -507,7 +653,7 @@ static float GNC_APP_LateralAxis(float pos, float vel, float ff, GNC_Phase_t pha
     if (v_tgt >  p->MaxLatSpeed) v_tgt =  p->MaxLatSpeed;
     if (v_tgt < -p->MaxLatSpeed) v_tgt = -p->MaxLatSpeed;
 
-    float v_err = v_tgt - vel + ff;
+    float v_err = v_tgt - vel;
     float db    = (phase == GNC_PHASE_APPROACH) ? p->LatVelDeadband_Approach_ms
                                                   : p->LatVelDeadband_ms;
     if (v_err >  db) return v_err - db;
@@ -517,20 +663,67 @@ static float GNC_APP_LateralAxis(float pos, float vel, float ff, GNC_Phase_t pha
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 /*                                                                           */
-/* GNC_APP_AttitudeAxis — rate change wanted on one attitude axis            */
+/* GNC_APP_PhasePlaneAxis — rate change wanted on one attitude axis          */
 /*                                                                           */
-/* target rate = AttKp × error (rad), clamped to ±MaxAttRate; the request   */
-/* is the rate error. The per-axis inertia turns it into angular impulse    */
-/* in ComputeControl — roll (Z, ~half the pitch/yaw inertia) no longer      */
-/* shares a single RotAccel calibrated for pitch/yaw.                       */
+/* Phase-plane control (realism phase 5). With e = |error| beyond the angle  */
+/* deadband, the target rate toward zero error is the slowest of            */
+/*   AttKp·e           linear near the deadband edge                         */
+/*   sqrt(2·α·e)       the braking curve: the fastest rate the RCS can still */
+/*                     stop from at the planned deceleration α               */
+/*   MaxAttRate        slew cap                                              */
+/* and a rate error under AttRateDeadband_rads is left alone (no chatter on  */
+/* the minimum impulse bit). Inside the angle deadband the target is zero    */
+/* rate, corrected only past SpinThreshold_rads, so a slow drift walks to    */
+/* the edge and is turned around there — the classic RCS limit cycle,        */
+/* sized by the deadband instead of by thruster chatter. Per axis.           */
 /*                                                                           */
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
-static float GNC_APP_AttitudeAxis(float err_deg, float angvel, const GNC_ParamTbl_t *p)
+static float GNC_APP_PhasePlaneAxis(float err_deg, float rate, float db_deg, const GNC_ParamTbl_t *p)
 {
-    float omega_tgt = p->AttKp * (err_deg * GNC_DEG2RAD);
-    if (omega_tgt >  p->MaxAttRate) omega_tgt =  p->MaxAttRate;
-    if (omega_tgt < -p->MaxAttRate) omega_tgt = -p->MaxAttRate;
-    return omega_tgt - angvel;
+    float e     = (fabsf(err_deg) - db_deg) * GNC_DEG2RAD;
+    float w_tgt = 0.0f;
+    float rdb   = p->SpinThreshold_rads;
+    float w_err;
+
+    if (e > 0.0f)
+    {
+        float w  = p->AttKp * e;
+        float wb = sqrtf(2.0f * p->AttCtrlAccel_rads2 * e);
+        if (wb < w)
+            w = wb;
+        if (w > p->MaxAttRate)
+            w = p->MaxAttRate;
+        w_tgt = (err_deg > 0.0f) ? w : -w;
+        rdb   = p->AttRateDeadband_rads;
+    }
+
+    w_err = w_tgt - rate;
+    return (fabsf(w_err) <= rdb) ? 0.0f : w_err;
+}
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+/*                                                                           */
+/* GNC_APP_CamDirection — unit retreat direction for the abort manoeuvre     */
+/*                                                                           */
+/* Away from the target port along the docking axis (−Z of the docking       */
+/* frame) in body axes when attitude is known; otherwise straight back      */
+/* along the body docking axis (−Z body), which needs no navigation at all. */
+/*                                                                           */
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+static void GNC_APP_CamDirection(const GNC_APP_Input_t *tlm, float dir_B[3])
+{
+    static const float BACK[3] = {0.0f, 0.0f, -1.0f};
+
+    if (tlm->AttValid)
+    {
+        GNC_DockToBody(tlm, BACK, dir_B);
+    }
+    else
+    {
+        dir_B[0] = BACK[0];
+        dir_B[1] = BACK[1];
+        dir_B[2] = BACK[2];
+    }
 }
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
@@ -607,37 +800,37 @@ static void GNC_APP_ManualControl(const GNC_APP_Input_t *tlm, const GNC_ParamTbl
 /*                                                                           */
 /* Output is the linear and angular impulse (body frame) GNC wants imparted  */
 /* this cycle: P = m·Δv, L = I·Δω. WHICH thrusters fire and for HOW LONG is  */
-/* the RCS app's job (allocation + PWM against its thruster table) — GNC no  */
-/* longer needs thruster force, per-group accelerations or moment arms.      */
+/* the RCS app's job (allocation + PWM against its thruster table).          */
 /*                                                                           */
-/*   Channel 1 — Axial (Z)                                                   */
-/*     APPROACH : v_tgt = clamp(AxialKp × range, MinCloseSpeed, cap)         */
-/*                cap = MaxCloseSpeed before HoldPoint1_m fires, then        */
-/*                MaxCloseSpeed_Inner                                        */
+/* Translation is worked out in the docking frame D (X/Y lateral, +Z toward  */
+/* the port) and rotated into body axes with NAV's attitude (realism phase  */
+/* 5; before, body and world axes were assumed to coincide).                 */
+/*   Channel 1 — Axial (D Z)                                                 */
+/*     APPROACH : v_tgt = clamp(AxialKp × range, MinCloseSpeed, cap), and   */
+/*                at most ProfileGuideFrac of the approach envelope;         */
+/*                cap = MaxCloseSpeed before HoldPoint1_m, then _Inner       */
 /*     CORRECT  : v_tgt = 0 (station-keep)                                   */
 /*     HOLD     : v_tgt = clamp(AxialHoldKp × (range − HoldRange_m),         */
 /*                ±MaxHoldSpeed)                                             */
-/*   Channel 2 — Lateral (X, Y): GNC_APP_LateralAxis                         */
-/*   Channel 3 — Attitude (all active phases): GNC_APP_AttitudeAxis,         */
-/*     skipped inside the attitude deadband unless spinning                  */
+/*   Channel 2 — Lateral (D X, Y): GNC_APP_LateralAxis                       */
+/*   CW feed-forward — accumulated per D axis, released at FfReleaseDv_ms    */
+/*   Channel 3 — Attitude (all active phases): GNC_APP_PhasePlaneAxis        */
 /*   MANUAL — hand controllers only (GNC_APP_ManualControl)                  */
-/*                                                                           */
-/* Removed with the move of allocation into FSW (realism phase 2): the       */
-/* shared burn duration + per-channel rescaling, the hard/soft brake choice, */
-/* the empirical Approach/BrakeAccel constants, and the 0.65 LAT_CORR +Fz    */
-/* coupling feedforward. All of those compensated for GNC not knowing the    */
-/* thruster geometry; the RCS allocator solves for it exactly.               */
-/*                                                                           */
-/* Reads only from the caller's local copy of tlm — no shared state.        */
+/*   DEPART — retreat along −Z_D (GNC_APP_CamDirection), attitude held       */
 /*                                                                           */
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 static GNC_Control_t GNC_APP_ComputeControl(const GNC_APP_Input_t *tlm, GNC_Phase_t phase, float dt)
 {
     GNC_Control_t         ctrl = {0};
     const GNC_ParamTbl_t *p    = GNC_APP_Data.ParamTblPtr;
-    float                 dv[3] = {0.0f, 0.0f, 0.0f}; /* body-frame Δv wanted this cycle (m/s)   */
-    float                 dw[3] = {0.0f, 0.0f, 0.0f}; /* body-frame Δω wanted this cycle (rad/s) */
-    float                 ff_x, ff_y, ff_z;             /* CW feedforward Δv per axis (m/s)        */
+    float                 dv_D[3] = {0.0f, 0.0f, 0.0f}; /* docking-frame Δv wanted this cycle (m/s) */
+    float                 dv[3]   = {0.0f, 0.0f, 0.0f}; /* body-frame Δv wanted this cycle (m/s)    */
+    float                 dw[3]   = {0.0f, 0.0f, 0.0f}; /* body-frame Δω wanted this cycle (rad/s)  */
+    float                 att_db_deg;
+    int                   i;
+
+    if (phase != GNC_PHASE_CORRECT && phase != GNC_PHASE_APPROACH && phase != GNC_PHASE_HOLD)
+        memset(GNC_APP_Data.FfAccum_D, 0, sizeof(GNC_APP_Data.FfAccum_D));
 
     /* IDLE and DOCKED: all thrust inhibited */
     if (phase == GNC_PHASE_IDLE || phase == GNC_PHASE_DOCKED)
@@ -649,41 +842,25 @@ static GNC_Control_t GNC_APP_ComputeControl(const GNC_APP_Input_t *tlm, GNC_Phas
         goto to_impulse;
     }
 
-    /* === CW Feedforward ============================================== */
-    /* ClohessyWiltshire.cs applies the differential gravity equations    */
-    /* to the chaser every FixedUpdate. Folding the equal-and-opposite    */
-    /* delta-v into each channel's velocity error pre-cancels the drift.  */
-    /* dt is the lock-step cycle length from SIM_STATE, so the per-cycle   */
-    /* delta-v is exact regardless of cycle rate.                          */
-    /*                                                                     */
-    /* LVLH mapping (same as ClohessyWiltshire.cs, +V-bar approach):       */
-    /*   radial      = +Y world   along-track = -Z world   cross = +X world */
-    /* Hill/CW, x radial, y along-track (velocity dir), z cross-track:     */
-    /*   a_rad   =  3n²·r_rad + 2n·v_along                                  */
-    /*   a_along = -2n·v_rad                                                */
-    /*   a_cross = -n²·r_cross                                              */
-    /* mapped back to world: ax = a_cross, ay = a_rad, az = -a_along.       */
-    /* Each ff = -(a_world) × dt; the axial channel's ClosingSpeed is      */
-    /* +Z-positive (chaser at -Z closing toward +Z), so ff_z applies as-is. */
-    /*                                                                     */
-    /* KNOWN LIMITATION (realism roadmap phase 5): the lateral ff is added */
-    /* INSIDE the deadbanded velocity error, so the ~5e-5 m/s-per-cycle     */
-    /* V-bar Coriolis term never accumulates into a burn on its own.        */
+    if (phase == GNC_PHASE_DEPART)
     {
-        const float n       = GNC_CW_MEAN_MOTION;
-        const float n2      = n * n;
-        const float r_rad   =  tlm->RelPos_Y;
-        const float r_cross =  tlm->RelPos_X;
-        const float v_rad   =  tlm->RelVel_Y;
-        const float v_along = -tlm->RelVel_Z;
-
-        const float a_rad   =  3.0f * n2 * r_rad + 2.0f * n * v_along;
-        const float a_along = -2.0f * n * v_rad;
-        const float a_cross = -n2 * r_cross;
-
-        ff_x = -(a_cross)  * dt;
-        ff_y = -(a_rad)    * dt;
-        ff_z = -(-a_along) * dt;
+        /* Retreat: whatever is left of the nominal CAM Δv; once that's done,
+        ** keep stepping while the free drift isn't passively safe (and NAV can
+        ** tell), up to CamMaxDeltaV_ms. GNC_APP_ProcessNavSolution ends DEPART. */
+        float want = p->CamDeltaV_ms - GNC_APP_Data.CamDv_ms;
+        float dir_B[3];
+        /* Never ask for less than a step: a remainder below the minimum
+        ** impulse bit would be dropped by RCS and the retreat would stall */
+        if ((want > 0.0f && want < GNC_CAM_STEP_MS) ||
+            (want < GNC_CAM_STEP_MS && !GNC_APP_Data.DriftSafe && tlm->RelNavValid))
+            want = GNC_CAM_STEP_MS;
+        if (GNC_APP_Data.CamDv_ms >= p->CamMaxDeltaV_ms || want < 0.0f)
+            want = 0.0f;
+        GNC_APP_CamDirection(tlm, dir_B);
+        for (i = 0; i < 3; i++)
+            dv[i] = dir_B[i] * want;
+        GNC_APP_Data.CamLastCmd_ms = want;
+        goto attitude;
     }
 
     /* === Channel 1 — Axial =========================================== */
@@ -693,11 +870,14 @@ static GNC_Control_t GNC_APP_ComputeControl(const GNC_APP_Input_t *tlm, GNC_Phas
         {
             /* Outer cap before HoldPoint1_m has fired, tighter cap after —
             ** models the real-world profile of a faster outer approach speed
-            ** and a slower, more cautious speed once inside the first hold. */
-            float cap = GNC_APP_Data.HoldPt1Armed ? p->MaxCloseSpeed : p->MaxCloseSpeed_Inner;
+            ** and a slower, more cautious speed once inside the first hold.
+            ** Never above ProfileGuideFrac of the approach envelope. */
+            float cap   = GNC_APP_Data.HoldPt1Armed ? p->MaxCloseSpeed : p->MaxCloseSpeed_Inner;
+            float guide = p->ProfileGuideFrac * GNC_APP_ProfileLimit(tlm->Range_m, p);
             v_axial_tgt = tlm->Range_m * p->AxialKp;
             if (v_axial_tgt < p->MinCloseSpeed) v_axial_tgt = p->MinCloseSpeed;
             if (v_axial_tgt > cap) v_axial_tgt = cap;
+            if (v_axial_tgt > guide) v_axial_tgt = guide;
         }
         else if (phase == GNC_PHASE_HOLD)
         {
@@ -714,77 +894,91 @@ static GNC_Control_t GNC_APP_ComputeControl(const GNC_APP_Input_t *tlm, GNC_Phas
             v_axial_tgt = 0.0f;
         }
 
-        /* ClosingSpeed_ms is +Z-positive (toward the ISS), same as body +Z */
-        dv[2] = v_axial_tgt - tlm->ClosingSpeed_ms + ff_z;
+        /* ClosingSpeed_ms is the port velocity along D +Z (toward the port) */
+        dv_D[2] = v_axial_tgt - tlm->ClosingSpeed_ms;
     }
 
-    /* === Channel 2 — Lateral position + velocity (X and Y) =========== */
+    /* === Channel 2 — Lateral position + velocity (D X and Y) ========== */
     /* Steers on the docking-PORT-relative LatOffset_X/Y (not the chaser  */
     /* origin), so rotation that sweeps the port off-axis is seen. The    */
     /* velocity term is the port point velocity v_cm + ω×r from NAV       */
     /* (realism phase 4), or the CoM velocity if LatVelAtPort = 0.        */
-    dv[0] = GNC_APP_LateralAxis(tlm->LatOffset_X, tlm->LatVel_X, ff_x, phase, p);
-    dv[1] = GNC_APP_LateralAxis(tlm->LatOffset_Y, tlm->LatVel_Y, ff_y, phase, p);
+    dv_D[0] = GNC_APP_LateralAxis(tlm->LatOffset_X, tlm->LatVel_X, phase, p);
+    dv_D[1] = GNC_APP_LateralAxis(tlm->LatOffset_Y, tlm->LatVel_Y, phase, p);
 
-    /* No usable relative solution (NAV not converged, or LIDAR lost long
-    ** enough): coast in translation rather than steer on a guess. Attitude
-    ** control below needs only the star tracker and gyro. */
-    if (!tlm->RelNavValid)
+    /* === CW feed-forward ============================================== */
+    /* ClohessyWiltshire.cs applies the differential gravity to the chaser */
+    /* every FixedUpdate; the equal-and-opposite Δv pre-cancels the drift. */
+    /* LVLH mapping (same as ClohessyWiltshire.cs, +V-bar approach):       */
+    /*   radial = +Y world   along-track = -Z world   cross-track = +X world */
+    /* Hill/CW, x radial, y along-track (velocity dir), z cross-track:     */
+    /*   a_rad = 3n²·r_rad + 2n·v_along, a_along = -2n·v_rad, a_cross = -n²·r_cross */
+    /* The per-cycle Δv (~1e-5 m/s) is far below the minimum impulse bit,  */
+    /* so it is accumulated per docking-frame axis and released as one     */
+    /* request at FfReleaseDv_ms (realism phase 5: before, it was added    */
+    /* inside the deadbanded lateral error and the V-bar Coriolis drift    */
+    /* was never cancelled).                                               */
+    if (tlm->RelNavValid)
     {
-        dv[0] = 0.0f;
-        dv[1] = 0.0f;
-        dv[2] = 0.0f;
-    }
+        const float n       = GNC_CW_MEAN_MOTION;
+        const float n2      = n * n;
+        const float a_rad   = 3.0f * n2 * tlm->RelPos_Y + 2.0f * n * (-tlm->RelVel_Z);
+        const float a_along = -2.0f * n * tlm->RelVel_Y;
+        const float a_cross = -n2 * tlm->RelPos_X;
+        float       ff_L[3], ff_D[3], q_D_L[4];
 
-    /* === Channel 3 — Attitude (all active phases) ====================== */
-    /*                                                                      */
-    /* Deadband: attitude corrections are skipped when all three errors are */
-    /* below the phase-scaled AttDeadband_deg AND the vehicle is not        */
-    /* spinning faster than SpinThreshold_rads on any axis. The angle       */
-    /* deadband breaks the lateral↔attitude limit cycle; the tighter spin   */
-    /* check stops a small sustained residual rate from silently            */
-    /* accumulating a large angle error inside the deadband.                */
-    /*   LAT_CORR 2× (wide: lateral burns disturb attitude slightly)        */
-    /*   APPROACH 0.5× (tight: nose-on-port precision)   HOLD 1×            */
-    {
-        float att_db_deg;
-        if      (phase == GNC_PHASE_APPROACH) att_db_deg = p->AttDeadband_deg * 0.5f;
-        else if (phase == GNC_PHASE_CORRECT)  att_db_deg = p->AttDeadband_deg * 2.0f;
-        else                                   att_db_deg = p->AttDeadband_deg;
-
-        float spin_th  = p->SpinThreshold_rads;
-        bool  spinning = fabsf(tlm->AngVel_X) > spin_th || fabsf(tlm->AngVel_Y) > spin_th ||
-                         fabsf(tlm->AngVel_Z) > spin_th;
-        bool  in_db    = att_db_deg > 0.0f &&
-                         fabsf(tlm->PitchError_deg) < att_db_deg &&
-                         fabsf(tlm->YawError_deg)   < att_db_deg &&
-                         fabsf(tlm->RollError_deg)  < att_db_deg;
-
-        if (!tlm->RateValid)
+        ff_L[0] = -a_cross * dt;
+        ff_L[1] = -a_rad * dt;
+        ff_L[2] = a_along * dt; /* -(a_world_z) = -(-a_along) */
+        GNC_QuatConj(tlm->DockQuat_L, q_D_L);
+        GNC_QuatRotate(q_D_L, ff_L, ff_D);
+        for (i = 0; i < 3; i++)
         {
-            /* No gyro: neither the rate term nor a safe correction exists */
-        }
-        else if (!tlm->AttValid)
-        {
-            /* No attitude: hold rates at zero until the star tracker is back */
-            if (spinning)
+            GNC_APP_Data.FfAccum_D[i] += ff_D[i];
+            if (fabsf(GNC_APP_Data.FfAccum_D[i]) >= p->FfReleaseDv_ms)
             {
-                dw[0] = -tlm->AngVel_X;
-                dw[1] = -tlm->AngVel_Y;
-                dw[2] = -tlm->AngVel_Z;
+                dv_D[i] += GNC_APP_Data.FfAccum_D[i];
+                GNC_APP_Data.FfAccum_D[i] = 0.0f;
             }
         }
-        else if (!(in_db && !spinning))
-        {
-            dw[0] = GNC_APP_AttitudeAxis(tlm->PitchError_deg, tlm->AngVel_X, p);
-            dw[1] = GNC_APP_AttitudeAxis(tlm->YawError_deg,   tlm->AngVel_Y, p);
-            dw[2] = GNC_APP_AttitudeAxis(tlm->RollError_deg,  tlm->AngVel_Z, p);
-        }
+        GNC_DockToBody(tlm, dv_D, dv);
+    }
+    else
+    {
+        /* No usable relative solution (NAV not converged, or LIDAR lost long
+        ** enough): coast in translation rather than steer on a guess. Attitude
+        ** control below needs only the star tracker and gyro. */
+        memset(GNC_APP_Data.FfAccum_D, 0, sizeof(GNC_APP_Data.FfAccum_D));
+    }
+
+attitude:
+    /* === Channel 3 — Attitude (all active phases) ====================== */
+    /* Phase-scaled angle deadband: the deadband breaks the lateral↔attitude */
+    /* limit cycle.  CORRECT 2× (wide: lateral burns disturb attitude),      */
+    /* APPROACH 0.5× (tight: nose-on-port precision), HOLD / DEPART 1×.      */
+    if      (phase == GNC_PHASE_APPROACH) att_db_deg = p->AttDeadband_deg * 0.5f;
+    else if (phase == GNC_PHASE_CORRECT)  att_db_deg = p->AttDeadband_deg * 2.0f;
+    else                                   att_db_deg = p->AttDeadband_deg;
+
+    if (!tlm->RateValid)
+    {
+        /* No gyro: neither the rate term nor a safe correction exists */
+    }
+    else if (!tlm->AttValid)
+    {
+        /* No attitude: hold rates at zero until the star tracker is back */
+        const float w[3] = {tlm->AngVel_X, tlm->AngVel_Y, tlm->AngVel_Z};
+        for (i = 0; i < 3; i++)
+            dw[i] = (fabsf(w[i]) > p->SpinThreshold_rads) ? -w[i] : 0.0f;
+    }
+    else
+    {
+        dw[0] = GNC_APP_PhasePlaneAxis(tlm->PitchError_deg, tlm->AngVel_X, att_db_deg, p);
+        dw[1] = GNC_APP_PhasePlaneAxis(tlm->YawError_deg,   tlm->AngVel_Y, att_db_deg, p);
+        dw[2] = GNC_APP_PhasePlaneAxis(tlm->RollError_deg,  tlm->AngVel_Z, att_db_deg, p);
     }
 
 to_impulse:
-    /* Impulse this cycle. Body ≈ world axes for the translation channels
-    ** (small-attitude assumption — roadmap phase 5 rotates properly). */
     ctrl.Px = p->VehicleMass * dv[0];
     ctrl.Py = p->VehicleMass * dv[1];
     ctrl.Pz = p->VehicleMass * dv[2];
@@ -918,11 +1112,33 @@ static void GNC_APP_PublishState(const NAV_SolutionMsg_t *Msg, const GNC_APP_Inp
     st->AngImpulseReq_Nms[0] = ctrl->Lx;
     st->AngImpulseReq_Nms[1] = ctrl->Ly;
     st->AngImpulseReq_Nms[2] = ctrl->Lz;
+    st->OverspeedStreak      = (GNC_APP_Data.OverspeedStreak > 0xFFFF) ? 0xFFFF : (uint16)GNC_APP_Data.OverspeedStreak;
+    st->CorridorStreak       = (GNC_APP_Data.CorridorStreak > 0xFFFF) ? 0xFFFF : (uint16)GNC_APP_Data.CorridorStreak;
+    st->DriftSafeRange_m     = GNC_APP_Data.DriftSafeRange_m;
+    st->CamDv_ms             = GNC_APP_Data.CamDv_ms;
 
     CFE_SB_TimeStampMsg(CFE_MSG_PTR(st->TelemetryHeader));
     CFE_SB_TransmitMsg(CFE_MSG_PTR(st->TelemetryHeader), true);
 
     CFE_SB_TransmitMsg(CFE_MSG_PTR(GNC_APP_Data.LcSampleCmd.CommandHeader), true);
+}
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+/*                                                                           */
+/* GNC_APP_ProcessThrusterCmd — RCS's answer to our last ACT_REQ             */
+/*                                                                           */
+/* Remember the impulse it really commanded (after saturation and minimum-  */
+/* impulse-bit effects) for next cycle's actuator-health check and the CAM  */
+/* bookkeeping.                                                              */
+/*                                                                           */
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+void GNC_APP_ProcessThrusterCmd(const SIM_IO_ThrusterCmdMsg_t *Msg)
+{
+    if (GNC_APP_Data.HavePrevSeq && Msg->Seq == GNC_APP_Data.PrevSeq)
+    {
+        GNC_APP_Data.PrevAchievedPz_Ns = Msg->AchievedLinImpulse_Ns[2];
+        GNC_APP_Data.PrevBurnValid     = true;
+    }
 }
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
@@ -975,6 +1191,9 @@ static void GNC_APP_BuildInput(const NAV_SolutionMsg_t *Msg, GNC_APP_Input_t *in
     in->LateralOffset_m = Msg->LateralOffset_m;
     in->LatOffset_X     = Msg->PortPos_D[0];
     in->LatOffset_Y     = Msg->PortPos_D[1];
+    memcpy(in->PortPos_D, Msg->PortPos_D, sizeof(in->PortPos_D));
+    memcpy(in->AttQuat_L, Msg->AttQuat_L, sizeof(in->AttQuat_L));
+    memcpy(in->DockQuat_L, Msg->DockFrameQuat_L, sizeof(in->DockQuat_L));
     if (p->LatVelAtPort)
     {
         in->LatVel_X = Msg->PortVel_D[0];
@@ -1036,7 +1255,7 @@ static void GNC_APP_BuildInput(const NAV_SolutionMsg_t *Msg, GNC_APP_Input_t *in
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 void GNC_APP_ProcessNavSolution(const NAV_SolutionMsg_t *Msg)
 {
-    static const char *const PHASE_NAMES[] = {"IDLE", "LAT_CORR", "APPROACH", "DOCKED", "HOLD", "MANUAL"};
+    static const char *const PHASE_NAMES[] = {"IDLE", "LAT_CORR", "APPROACH", "DOCKED", "HOLD", "MANUAL", "DEPART"};
 
     GNC_APP_Input_t tlm;
     GNC_Control_t   ctrl = {0};
@@ -1130,7 +1349,7 @@ void GNC_APP_ProcessNavSolution(const NAV_SolutionMsg_t *Msg)
     ** Emit an EVS event on every transition for ground visibility.
     */
     GNC_Phase_t prev_phase = GNC_APP_Data.Phase;
-    GNC_Phase_t new_phase  = GNC_APP_SelectPhase(&tlm, prev_phase);
+    GNC_Phase_t new_phase  = GNC_APP_SelectPhase(&tlm, prev_phase, dt);
 
     if (new_phase != prev_phase)
     {
@@ -1144,6 +1363,64 @@ void GNC_APP_ProcessNavSolution(const NAV_SolutionMsg_t *Msg)
         if (new_phase == GNC_PHASE_MANUAL)
             CFE_EVS_SendEvent(GNC_APP_MANUAL_INF_EID, CFE_EVS_EventType_INFORMATION,
                               "GNC_APP: CREW MANUAL TAKEOVER (hand controller) — autopilot off until GO");
+    }
+
+    /* Passive safety: where would free drift take the port from here? */
+    {
+        const GNC_ParamTbl_t *p = GNC_APP_Data.ParamTblPtr;
+        GNC_APP_Data.DriftSafeRange_m = GNC_APP_DriftSafeRange(&tlm, p);
+        GNC_APP_Data.DriftSafe        = tlm.RelNavValid && GNC_APP_Data.DriftSafeRange_m >= p->PassiveSafeRange_m;
+    }
+
+    /* Abort manoeuvre bookkeeping: Δv delivered along the retreat direction
+    ** (IMU-measured over the cycle that just ended), and the end condition. */
+    if (GNC_APP_Data.Phase == GNC_PHASE_DEPART)
+    {
+        const GNC_ParamTbl_t *p = GNC_APP_Data.ParamTblPtr;
+        float                 dir_B[3];
+        GNC_APP_CamDirection(&tlm, dir_B);
+        GNC_APP_Data.CamCycles++;
+        if (tlm.DvValid)
+        {
+            float along = tlm.DeltaV_B[0] * dir_B[0] + tlm.DeltaV_B[1] * dir_B[1] + tlm.DeltaV_B[2] * dir_B[2];
+            if (along > 0.0f)
+                GNC_APP_Data.CamDv_ms += along;
+        }
+        else
+        {
+            /* No accelerometer: count what was asked for (open loop) */
+            GNC_APP_Data.CamDv_ms += GNC_APP_Data.CamLastCmd_ms;
+        }
+        if ((GNC_APP_Data.CamDv_ms >= p->CamDeltaV_ms && (GNC_APP_Data.DriftSafe || !tlm.RelNavValid)) ||
+            GNC_APP_Data.CamDv_ms >= p->CamMaxDeltaV_ms || GNC_APP_Data.CamCycles >= GNC_CAM_MAX_CYCLES)
+        {
+            CFE_EVS_SendEvent(GNC_APP_CAM_INF_EID,
+                              GNC_APP_Data.DriftSafe ? CFE_EVS_EventType_INFORMATION : CFE_EVS_EventType_ERROR,
+                              "GNC_APP: abort manoeuvre complete — %.2f m/s in %lu cycles, free drift %s "
+                              "(closest %.1f m); coasting, send GO to resume",
+                              (double)GNC_APP_Data.CamDv_ms, (unsigned long)GNC_APP_Data.CamCycles,
+                              GNC_APP_Data.DriftSafe ? "passively safe" : tlm.RelNavValid ? "NOT SAFE" : "unknown (no NAV)",
+                              (double)GNC_APP_Data.DriftSafeRange_m);
+            GNC_APP_Data.Phase = GNC_PHASE_IDLE;
+        }
+    }
+
+    /* Approach-envelope monitors (LC decides; GNC only counts) */
+    {
+        const GNC_ParamTbl_t *p     = GNC_APP_Data.ParamTblPtr;
+        GNC_Phase_t           ph    = GNC_APP_Data.Phase;
+        bool                  auto_ = ph == GNC_PHASE_CORRECT || ph == GNC_PHASE_APPROACH || ph == GNC_PHASE_HOLD;
+
+        if (tlm.RelNavValid && (ph == GNC_PHASE_APPROACH || ph == GNC_PHASE_HOLD) &&
+            tlm.ClosingSpeed_ms > GNC_APP_ProfileLimit(tlm.Range_m, p))
+            GNC_APP_Data.OverspeedStreak++;
+        else
+            GNC_APP_Data.OverspeedStreak = 0;
+
+        if (tlm.RelNavValid && auto_ && tlm.Range_m < p->CorridorCheckRange_m && !GNC_APP_Data.InCorridor)
+            GNC_APP_Data.CorridorStreak++;
+        else
+            GNC_APP_Data.CorridorStreak = 0;
     }
 
     GNC_APP_Data.HkTlm.Phase = (uint8)GNC_APP_Data.Phase;
@@ -1294,6 +1571,14 @@ void GNC_APP_ProcessCmd(CFE_SB_Buffer_t *MsgBuf)
         case GNC_APP_HOLD_CC:
         {
             if (!GNC_APP_VerifyCmdLength(&MsgBuf->Msg, sizeof(GNC_APP_HoldCmd_t))) break;
+            if (GNC_APP_Data.Phase == GNC_PHASE_DEPART || GNC_APP_Data.Phase == GNC_PHASE_DOCKED)
+            {
+                GNC_APP_Data.HkTlm.CmdErrCount++;
+                CFE_EVS_SendEvent(GNC_APP_HOLD_INF_EID, CFE_EVS_EventType_ERROR,
+                                  "GNC_APP: HOLD rejected — %s",
+                                  GNC_APP_Data.Phase == GNC_PHASE_DOCKED ? "docked" : "abort manoeuvre in progress");
+                break;
+            }
             GNC_APP_Data.HkTlm.CmdCount++;
             GNC_APP_Data.Phase          = GNC_PHASE_HOLD;
             GNC_APP_Data.HkTlm.Phase    = (uint8)GNC_PHASE_HOLD;
@@ -1313,6 +1598,14 @@ void GNC_APP_ProcessCmd(CFE_SB_Buffer_t *MsgBuf)
             bool was_hold   = (GNC_APP_Data.Phase == GNC_PHASE_HOLD);
             bool was_manual = (GNC_APP_Data.Phase == GNC_PHASE_MANUAL);
             bool was_abort  = GNC_APP_Data.AbortLatch;
+
+            if (GNC_APP_Data.Phase == GNC_PHASE_DEPART)
+            {
+                GNC_APP_Data.HkTlm.CmdErrCount++;
+                CFE_EVS_SendEvent(GNC_APP_GO_INF_EID, CFE_EVS_EventType_ERROR,
+                                  "GNC_APP: GO rejected — abort manoeuvre in progress");
+                break;
+            }
 
             if (!was_hold && !was_manual && !was_abort)
             {
@@ -1342,14 +1635,34 @@ void GNC_APP_ProcessCmd(CFE_SB_Buffer_t *MsgBuf)
         case GNC_APP_ABORT_CC:
             if (!GNC_APP_VerifyCmdLength(&MsgBuf->Msg, sizeof(GNC_APP_AbortCmd_t))) break;
             GNC_APP_Data.HkTlm.CmdCount++;
-            GNC_APP_Data.Phase          = GNC_PHASE_IDLE;
-            GNC_APP_Data.AbortLatch     = true;
-            GNC_APP_Data.HkTlm.Phase    = (uint8)GNC_PHASE_IDLE;
-            /* No out-of-band coast packet: in lock-step Unity only accepts the
-            ** command answering its current cycle, and the next cycle (at most
-            ** one GNC period away) commands zero thrust from the IDLE phase. */
-            CFE_EVS_SendEvent(GNC_APP_ABORT_INF_EID, CFE_EVS_EventType_CRITICAL,
-                              "GNC_APP: *** ABORT *** all thrust inhibited — send GO to resume");
+            GNC_APP_Data.AbortLatch = true;
+            if (GNC_APP_Data.Phase == GNC_PHASE_DOCKED || GNC_APP_Data.LatestIn.Captured)
+            {
+                /* Captured: the mechanism holds the vehicle; nothing to fly away from */
+                CFE_EVS_SendEvent(GNC_APP_ABORT_INF_EID, CFE_EVS_EventType_CRITICAL,
+                                  "GNC_APP: *** ABORT *** while captured — thrust inhibited");
+            }
+            else if (GNC_APP_Data.Phase == GNC_PHASE_IDLE || GNC_APP_Data.Phase == GNC_PHASE_DEPART)
+            {
+                /* Already stopped, or already leaving: just latch */
+                CFE_EVS_SendEvent(GNC_APP_ABORT_INF_EID, CFE_EVS_EventType_CRITICAL,
+                                  "GNC_APP: *** ABORT *** (latched; %s)",
+                                  GNC_APP_Data.Phase == GNC_PHASE_DEPART ? "manoeuvre continues" : "thrust inhibited");
+            }
+            else
+            {
+                /* Collision-avoidance manoeuvre. In lock-step it starts on the
+                ** next cycle, at most one GNC period away. */
+                GNC_APP_Data.Phase     = GNC_PHASE_DEPART;
+                GNC_APP_Data.CamDv_ms      = 0.0f;
+                GNC_APP_Data.CamCycles     = 0;
+                GNC_APP_Data.CamLastCmd_ms = 0.0f;
+                CFE_EVS_SendEvent(GNC_APP_ABORT_INF_EID, CFE_EVS_EventType_CRITICAL,
+                                  "GNC_APP: *** ABORT *** collision-avoidance manoeuvre: retreat %.2f m/s, "
+                                  "then coast — send GO to resume",
+                                  (double)GNC_APP_Data.ParamTblPtr->CamDeltaV_ms);
+            }
+            GNC_APP_Data.HkTlm.Phase = (uint8)GNC_APP_Data.Phase;
             break;
 
         /* ---------------------------------------------------------------- */

@@ -805,6 +805,11 @@ void NAV_Step(NAV_State_t *S, const NAV_CfgTbl_t *Cfg, const SIMLINK_SimState_t 
 
     /* --- 5. Outputs ------------------------------------------------------ */
     Out->ConsecRpsRejects = F->ConsecRejects;
+    {
+        float q_tmp[4];
+        NAV_QuatMul(Cfg->TargetAttQuat_L, Cfg->TargetPortQuat_T, q_tmp);
+        NAV_QuatMul(q_tmp, Cfg->DockedQuat_TP, Out->DockFrameQuat_L);
+    }
     for (i = 0; i < 3; i++)
     {
         Out->AngRate_B[i] = imu ? (float)(gyro[i] - (A->Initialized ? A->Bias[i] : 0.0)) : 0.0f;

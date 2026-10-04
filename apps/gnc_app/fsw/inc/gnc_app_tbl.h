@@ -11,6 +11,8 @@
 #define GNC_APP_PARAM_TBL_NAME "ParamTbl"
 #define GNC_APP_PARAM_TBL_FILE "/cf/gnc_param_tbl.tbl"
 
+#define GNC_PROFILE_MAX 6 /* approach-envelope breakpoints */
+
 /*
 ** GNC parameter table — all gains and physical constants in one loadable struct.
 **
@@ -264,6 +266,53 @@ typedef struct
     ** the old behaviour back without a code change.
     */
     uint32 LatVelAtPort;
+
+    /*
+    ** Phase-plane attitude control (realism phase 5). Outside the angle
+    ** deadband the target rate follows the slower of a linear law (AttKp × e)
+    ** and the braking curve sqrt(2·α·e) — the rate the RCS can still stop from
+    ** at a planned deceleration α — capped at MaxAttRate (e = error beyond the
+    ** deadband). A rate error under AttRateDeadband_rads is left alone so the
+    ** minimum impulse bit doesn't chatter; inside the angle deadband only a
+    ** drift faster than SpinThreshold_rads is corrected.
+    */
+    float AttCtrlAccel_rads2;   /* rad/s² — planned braking deceleration (well under RCS authority) */
+    float AttRateDeadband_rads; /* rad/s — ignored rate error outside the angle deadband            */
+
+    /*
+    ** CW feed-forward accumulator: the per-cycle gravity-gradient / Coriolis
+    ** correction (~1e-5 m/s) is far below the minimum impulse bit, so it is
+    ** accumulated per axis and released as one request once it reaches
+    ** FfReleaseDv_ms — outside the velocity deadband, so drift is actually
+    ** cancelled instead of silently absorbed (the V-bar lateral drift).
+    */
+    float FfReleaseDv_ms;
+
+    /*
+    ** Approach envelope: maximum closing speed vs range (piecewise linear over
+    ** ProfileCount breakpoints, ranges ascending). Guidance targets stay at or
+    ** below ProfileGuideFrac of it; above the limit in APPROACH/HOLD counts
+    ** OverspeedStreak (LC -> HOLD). Inside CorridorCheckRange_m, a lateral
+    ** offset outside the approach cone counts CorridorStreak (LC -> ABORT).
+    */
+    uint32 ProfileCount;
+    float  ProfileRange_m[GNC_PROFILE_MAX];
+    float  ProfileMaxClose_ms[GNC_PROFILE_MAX];
+    float  ProfileGuideFrac;
+    float  CorridorCheckRange_m;
+
+    /*
+    ** Abort = collision-avoidance manoeuvre (DEPART phase): retreat along the
+    ** docking axis (away from the port) for at least CamDeltaV_ms, then keep
+    ** burning — up to CamMaxDeltaV_ms — until the predicted free-drift (CW)
+    ** trajectory stays at least PassiveSafeRange_m from the port between
+    ** PassiveSafeStart_s and PassiveSafeHorizon_s from now. Then coast (IDLE).
+    */
+    float CamDeltaV_ms;
+    float CamMaxDeltaV_ms;
+    float PassiveSafeRange_m;
+    float PassiveSafeStart_s;
+    float PassiveSafeHorizon_s;
 
 } GNC_ParamTbl_t;
 

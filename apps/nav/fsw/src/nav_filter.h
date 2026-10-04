@@ -93,6 +93,7 @@ typedef struct
     float  PosSigma_m;
     float  VelSigma_ms;
     float  AttSigma_rad;
+    float  DockFrameQuat_L[4]; /* q_L_D from the table geometry */
     float  GyroBias_rads[3];
     float  AccelBias_mss[3];
     float  InnovSigma;      /* Mahalanobis distance of this cycle's LIDAR fix (0 if none) */

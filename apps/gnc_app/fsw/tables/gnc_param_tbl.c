@@ -47,10 +47,13 @@ GNC_ParamTbl_t GNC_ParamTbl =
        Both phases now hold the centerline continuously; APPROACH uses a
        softer gain to keep burns small enough to avoid the lateral/attitude
        coupling limit cycle under APPROACH's tighter attitude deadband. */
-    .LatKp_Approach    = 0.006f, /* softened further from 0.01 (half of LatKp) — smaller
-                                    target velocity per meter of offset means shorter, gentler
-                                    burns during APPROACH, reducing the attitude disturbance
-                                    that was feeding the lateral/attitude limit cycle          */
+    .LatKp_Approach    = 0.03f,  /* phase 5 (Monte Carlo trade, 60 runs per point): 0.006 with
+                                    a 2 mm/s deadband left lateral uncontrolled within 0.33 m
+                                    of the axis (deadband / Kp) — contact lateral 5.0 cm mean,
+                                    9 cm worst against a 10 cm limit. With NAV port velocity and
+                                    the phase-plane attitude loop the lateral/attitude limit
+                                    cycle that motivated it is gone: 0.03 / 1 mm/s gives 1.1 cm
+                                    mean, 2.3 cm worst, for ~5 % more propellant.             */
 
     /* Corridor-relative phase gate for the APPROACH -> CORRECT revert only
        (replaces the old fixed-meter LatCorrectGate — see doc comment in
@@ -114,7 +117,8 @@ GNC_ParamTbl_t GNC_ParamTbl =
 
     /* Attitude PD controller */
     .AttKp           =  0.25f,  /* (rad/s)/rad — reduced to limit overshoot      */
-    .MaxAttRate      =  0.20f,  /* rad/s — cap per axis                          */
+    .MaxAttRate      =  0.02f,  /* rad/s — cap per axis (~1.1 deg/s; was 0.20 before the
+                                   phase-5 phase-plane controller bounded slews itself) */
 
     /* Attitude deadband — breaks the lateral↔attitude coupling limit cycle      */
     /* HALVED 2026-07-25 (2.0 -> 1.0) after the RCS thruster-cant fix: the 2.0°
@@ -166,7 +170,8 @@ GNC_ParamTbl_t GNC_ParamTbl =
        APPROACH: kept at 0.002, unchanged since the original phase split —
        this tightening pass is CORRECT-only, same as last time. */
     .LatVelDeadband_ms          = 0.00035f, /* m/s — CORRECT: coast below this */
-    .LatVelDeadband_Approach_ms = 0.002f,   /* m/s — APPROACH: coast below this */
+    .LatVelDeadband_Approach_ms = 0.001f,   /* m/s — APPROACH: coast below this (phase 5:
+                                               was 0.002, see LatKp_Approach) */
     /* The limit cycle: lateral burn disturbs roll ~0.5–1°; at AttKp=0.50 that   */
     /* fires a correction every cycle; the correction couples back into lateral.  */
     /* With a 2° deadband, sub-2° perturbations coast rather than being fought.  */
@@ -194,6 +199,32 @@ GNC_ParamTbl_t GNC_ParamTbl =
     /* Lateral channel steers on the docking-port point velocity (NAV), the
        derivative of the port offset it controls. 0 = old CoM velocity. */
     .LatVelAtPort = 1,
+
+    /* Phase-plane attitude (phase 5). α = 0.01 rad/s² is about a third of what
+       two pitch/yaw thrusters deliver on 48000 kg·m², leaving authority for
+       translation. MaxAttRate (above) caps slews; the rate deadband sits just
+       over the minimum angular impulse bit (~3e-4 rad/s). */
+    .AttCtrlAccel_rads2   = 0.01f,
+    .AttRateDeadband_rads = 0.0004f,
+
+    /* ≈ one minimum impulse bit: 8 N·s / 12000 kg */
+    .FfReleaseDv_ms = 0.0007f,
+
+    /* Approach envelope: 0.36 m/s out to 20 m (outer cap 0.30 + margin), 0.15 m/s
+       inside 10 m (inner cap 0.10 + margin); linear in between. */
+    .ProfileCount         = 4,
+    .ProfileRange_m       = {0.0f, 10.0f, 20.0f, 1000.0f},
+    .ProfileMaxClose_ms   = {0.15f, 0.15f, 0.36f, 0.36f},
+    .ProfileGuideFrac     = 0.9f,
+    .CorridorCheckRange_m = 20.0f,
+
+    /* Collision-avoidance manoeuvre. 0.1 m/s posigrade from +V-bar rises ~180 m
+       and drifts behind the station: passively safe for an orbit. */
+    .CamDeltaV_ms         = 0.10f,
+    .CamMaxDeltaV_ms      = 0.30f,
+    .PassiveSafeRange_m   = 10.0f,
+    .PassiveSafeStart_s   = 120.0f,
+    .PassiveSafeHorizon_s = 5600.0f, /* one ISS orbit */
 };
 
 /*

@@ -156,6 +156,7 @@ static void NAV_ProcessSimState(const SIM_IO_SimStateMsg_t *Msg)
     Sol->PosSigma_m   = Out.PosSigma_m;
     Sol->VelSigma_ms  = Out.VelSigma_ms;
     Sol->AttSigma_rad = Out.AttSigma_rad;
+    memcpy(Sol->DockFrameQuat_L, Out.DockFrameQuat_L, sizeof(Sol->DockFrameQuat_L));
 
     NAV_Data.HkTlm.Status       = Out.Status;
     NAV_Data.HkTlm.PosSigma_m   = Out.PosSigma_m;

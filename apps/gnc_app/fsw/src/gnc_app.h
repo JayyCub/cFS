@@ -122,7 +122,7 @@
 ** SCH_LAB instead. Indices must match sample_defs/cpu1/tables/lc_def_adt.c.
 */
 #define GNC_APP_LC_CYCLE_AP_FIRST 1
-#define GNC_APP_LC_CYCLE_AP_LAST  3
+#define GNC_APP_LC_CYCLE_AP_LAST  5
 
 /* Seconds of silence after which a returning SIM_STATE is worth an event */
 #define GNC_LINK_RESTORED_EVT_SEC 2
@@ -160,6 +160,14 @@
 #define GNC_APP_LINK_INF_EID      28  /* sim link restored after a stale period            */
 #define GNC_APP_MANUAL_INF_EID    29  /* crew hand-controller takeover                     */
 #define GNC_APP_NAV_INF_EID       30  /* NAV relative solution lost / restored             */
+#define GNC_APP_CAM_INF_EID       31  /* collision-avoidance manoeuvre started / complete   */
+
+/* DEPART gives up after this many cycles even if the burn isn't done (60 s) */
+#define GNC_CAM_MAX_CYCLES 300
+/* While burning on for passive safety, request this much retreat Δv per cycle */
+#define GNC_CAM_STEP_MS 0.02f
+/* Free-drift prediction grid step (s) */
+#define GNC_DRIFT_STEP_S 20.0f
 
 /* Ground command function codes: gnc_app_msg.h (shared with the SC RTS tables) */
 
@@ -198,8 +206,13 @@ typedef GNC_APP_NoArgsCmd_t GNC_APP_AbortCmd_t;
 **   MANUAL  — crew flying on the hand controllers (THC accel command, RHC rate
 **             command with rate hold). Entered on any stick deflection from any
 **             undocked phase; released only by GO (-> CORRECT) or ABORT.
+**   DEPART  — abort: collision-avoidance manoeuvre (realism phase 5). Retreat
+**             along the docking axis until the free drift is passively safe,
+**             then IDLE. GO is refused until it completes; the crew can still
+**             take over on the sticks.
 **
-** ABORT command sets IDLE + AbortLatch; all thrust inhibited until GO received.
+** ABORT command sets AbortLatch and starts DEPART (IDLE if already stopped);
+** after the manoeuvre all thrust is inhibited until GO.
 **
 ** Autonomous transitions (CORRECT ↔ APPROACH) are managed by GNC_APP_SelectPhase()
 ** with a hysteresis pair (GNC_LAT_APPROACH_GATE / GNC_LAT_CORRECT_GATE).
@@ -212,7 +225,8 @@ typedef enum
     GNC_PHASE_APPROACH = GNC_APP_PHASE_APPROACH, /* final approach — axial + lateral hold   */
     GNC_PHASE_DOCKED   = GNC_APP_PHASE_DOCKED,   /* docked — all thrust inhibited           */
     GNC_PHASE_HOLD     = GNC_APP_PHASE_HOLD,     /* ground-commanded hold — await GO        */
-    GNC_PHASE_MANUAL   = GNC_APP_PHASE_MANUAL    /* crew hand-controller flight — await GO  */
+    GNC_PHASE_MANUAL   = GNC_APP_PHASE_MANUAL,   /* crew hand-controller flight — await GO  */
+    GNC_PHASE_DEPART   = GNC_APP_PHASE_DEPART    /* abort retreat (CAM) in progress         */
 } GNC_Phase_t;
 
 /*
@@ -232,6 +246,7 @@ typedef struct
     float ClosingSpeed_ms;           /* port closing rate along D +Z, + = closing (m/s)          */
     float LateralOffset_m;           /* port distance from the docking axis (m)                  */
     float LatOffset_X, LatOffset_Y;  /* signed port lateral offset, D X/Y (m)                    */
+    float PortPos_D[3];              /* chaser port - target port, docking frame (m)             */
     float LatVel_X, LatVel_Y;        /* lateral velocity the lateral channel steers on (m/s):
                                      ** port point (D) or CoM (LVLH), per LatVelAtPort          */
     float RelPos_X, RelPos_Y, RelPos_Z; /* chaser CoM - target ref, LVLH (m) — CW feed-forward  */
@@ -241,6 +256,8 @@ typedef struct
     float YawError_deg;              /* attitude (quaternion based, NAV)                         */
     float RollError_deg;
     float DeltaV_B[3];               /* IMU-measured Δv over the cycle that just ended (m/s)     */
+    float AttQuat_L[4];              /* q_L_B, NAV attitude estimate                             */
+    float DockQuat_L[4];             /* q_L_D, docking frame axes in LVLH                        */
     bool  RelNavValid;               /* relative position/velocity usable                        */
     bool  AttValid;                  /* attitude error usable                                    */
     bool  RateValid;                 /* AngVel usable                                            */
@@ -291,6 +308,17 @@ typedef struct
     bool               InCorridor;         /* port offset inside the approach cone (NAV)      */
     bool               NavInvalidLatched;  /* NAV relative solution unusable — reported once  */
 
+    /* Phase 5: guidance monitors and abort manoeuvre */
+    float              FfAccum_D[3];       /* CW feed-forward Δv accumulated, docking frame    */
+    uint32             OverspeedStreak;    /* cycles above the approach envelope               */
+    uint32             CorridorStreak;     /* cycles outside the cone inside CorridorCheckRange */
+    float              DriftSafeRange_m;   /* predicted closest free-drift approach (STATE)    */
+    bool               DriftSafe;          /* DriftSafeRange_m >= PassiveSafeRange_m           */
+    float              CamDv_ms;           /* DEPART: retreat Δv delivered                     */
+    uint32             CamCycles;          /* DEPART: cycles so far                            */
+    float              CamLastCmd_ms;      /* DEPART: retreat Δv requested last cycle — counted
+                                           ** as delivered when the IMU can't measure it      */
+
     /* Hardware readings from the latest SIM_STATE, matched to the NAV solution by Seq */
     uint32             HwSeq;
     float              HwThc[3];
@@ -332,6 +360,7 @@ void         GNC_APP_Main(void);
 CFE_Status_t GNC_APP_Init(void);
 void         GNC_APP_ProcessSimState(const SIM_IO_SimStateMsg_t *Msg);
 void         GNC_APP_ProcessNavSolution(const NAV_SolutionMsg_t *Msg);
+void         GNC_APP_ProcessThrusterCmd(const SIM_IO_ThrusterCmdMsg_t *Msg);
 void         GNC_APP_SendHk(void);
 void         GNC_APP_ProcessCmd(CFE_SB_Buffer_t *MsgBuf);
 /* Publishes the impulse request as RCS_ACT_REQ_MID, tagged with the
