@@ -3,3 +3,5 @@ simple.mk export-ignore
 distbuild.mk export-ignore
 apps/sbn_f_remap export-ignore
 apps/sbn_udp export-ignore
+# shell script run inside the Linux dev container: keep LF on Windows checkouts
+apps/gnc_app/unit-test/run_mc.sh text eol=lf
