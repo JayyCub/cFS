@@ -102,6 +102,9 @@ TO_LAB_Subs_t TO_LAB_Subs =
         {CFE_SB_MSGID_WRAP_VALUE(0x0896),                 {0, 0}, 1},
         /* RCS_HK_TLM_MID = 0x0899 */
         {CFE_SB_MSGID_WRAP_VALUE(0x0899),                 {0, 0}, 1},
+        /* NAV_HK_TLM_MID = 0x08D0 (the per-cycle NAV_SOLUTION goes to the DS recorder;
+           GNC's STATE packet already carries the values GNC flew on) */
+        {CFE_SB_MSGID_WRAP_VALUE(0x08D0),                 {0, 0}, 1},
 #ifdef CFS_SBN_ENABLED
         {CFE_SB_MSGID_WRAP_VALUE(SBN_HK_TLM_MID),         {0, 0}, 1},
         {CFE_SB_MSGID_WRAP_VALUE(SBN_HKNET_TLM_MID),      {0, 0}, 1},

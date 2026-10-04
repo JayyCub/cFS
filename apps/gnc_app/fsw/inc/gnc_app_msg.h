@@ -50,10 +50,11 @@ typedef struct
 #define GNC_APP_FLAG_ABORT_LATCH   0x01u /* ABORT latched — guidance inhibited until GO    */
 #define GNC_APP_FLAG_HOLDPT1_ARMED 0x02u /* outer autonomous hold point not yet reached    */
 #define GNC_APP_FLAG_HOLDPT2_ARMED 0x04u /* inner autonomous hold point not yet reached    */
-#define GNC_APP_FLAG_IN_CORRIDOR   0x08u /* sim-reported: inside the approach corridor     */
-#define GNC_APP_FLAG_CONTACT       0x10u /* sim-reported: capture/docked flag              */
+#define GNC_APP_FLAG_IN_CORRIDOR   0x08u /* NAV port offset inside the approach cone       */
+#define GNC_APP_FLAG_CONTACT       0x10u /* capture latches engaged (mechanism switch)     */
 #define GNC_APP_FLAG_BAD_CTRL      0x20u /* last control output was non-finite (coasting)  */
 #define GNC_APP_FLAG_LINK_UP       0x40u /* at least one SIM_STATE received since start    */
+#define GNC_APP_FLAG_NAV_INVALID   0x80u /* NAV relative solution unusable: translation coasts */
 
 /*
 ** Housekeeping telemetry (GNC_APP_HK_TLM_MID), 1 Hz on SCH_LAB's SEND_HK.
@@ -96,13 +97,13 @@ typedef struct
                                                    ** decides when it counts as an anomaly)          */
     uint16                    SettleCounter;       /* CORRECT->APPROACH settle-gate progress (cycles) */
     uint16                    Spare;
-    float                     Range_m;
+    float                     Range_m;             /* NAV: port to port                              */
     float                     ClosingSpeed_ms;     /* + = closing                                     */
     float                     LateralOffset_m;
-    float                     LatOffset_m[2];      /* signed port lateral offset, world X/Y           */
-    float                     AttErr_deg[3];       /* pitch / yaw / roll error                        */
-    float                     AngVel_rads[3];      /* body rates                                      */
-    float                     RelPos_m[3];         /* chaser - target, world (+Y radial, -Z along)    */
+    float                     LatOffset_m[2];      /* NAV: port lateral offset, docking frame X/Y    */
+    float                     AttErr_deg[3];       /* NAV quaternion error, body X/Y/Z (pitch/yaw/roll) */
+    float                     AngVel_rads[3];      /* gyro body rates                                 */
+    float                     RelPos_m[3];         /* NAV: chaser CoM - target ref, LVLH (+Y radial)  */
     float                     RelVel_ms[3];
     float                     LinImpulseReq_Ns[3]; /* impulse requested from RCS this cycle (body)    */
     float                     AngImpulseReq_Nms[3];

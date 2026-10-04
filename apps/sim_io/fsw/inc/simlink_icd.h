@@ -21,12 +21,16 @@
 ** v3 (realism phase 2): cFS now does thruster allocation and PWM itself, so
 ** the command is per-thruster valve on-times, not a wrench; SIM_STATE carries
 ** the crew hand-controller deflections so manual flight also goes through FSW.
+**
+** v4 (realism phase 4): SIM_STATE carries raw sensor readings (IMU, star
+** tracker, relative-pose LIDAR, docking-mechanism switches) instead of
+** truth-derived navigation. The cFS NAV app does the navigation.
 */
 
 #include "common_types.h"
 
 #define SIMLINK_SYNC_WORD 0x324B4C53u /* bytes 'S','L','K','2' on the wire (LE) */
-#define SIMLINK_VERSION   3u
+#define SIMLINK_VERSION   4u
 
 #define SIMLINK_TYPE_SIM_STATE    1u /* Unity -> cFS, once per GNC cycle            */
 #define SIMLINK_TYPE_THRUSTER_CMD 3u /* cFS -> Unity, echoes the SIM_STATE Seq      */
@@ -52,43 +56,51 @@ typedef struct
     uint16 Spare;
 } SIMLINK_Trailer_t;
 
-/* Flags bits in SIMLINK_SimState_t */
-#define SIMLINK_FLAG_IN_CORRIDOR 0x1u
-#define SIMLINK_FLAG_DOCKED      0x2u
+/* SensorValid bits in SIMLINK_SimState_t: the device produced a reading this cycle */
+#define SIMLINK_SENSOR_IMU 0x1u /* GyroRate_B and DeltaV_B                                */
+#define SIMLINK_SENSOR_ST  0x2u /* StQuat                                                 */
+#define SIMLINK_SENSOR_RPS 0x4u /* RpsRange/Az/El — target in field of view and in range */
+
+/* MechFlags bits in SIMLINK_SimState_t: docking-mechanism switches */
+#define SIMLINK_MECH_CAPTURE 0x1u /* soft-capture latches engaged */
 
 /*
-** SIM_STATE payload (Phase 1: still truth-derived relative nav — Phase 4 of the
-** realism roadmap replaces this with raw sensor measurements).
+** SIM_STATE payload — raw sensor readings, sampled at the cycle boundary.
 **
-** Frames: LVLH/world axes are Unity world axes — +Y radial (up), -Z along-track
-** (velocity direction; the chaser approaches the ISS forward port from +V-bar),
-** +X cross-track. Attitude errors and AngVel are in the chaser docking-port frame.
+** Frames:
+**   body (B)   chaser vehicle axes (+Z toward the docking port, +X right, +Y up),
+**              origin at the centre of mass — the same frame as the RCS table.
+**   LVLH (L)   Unity world axes: +Y radial (up), -Z along-track (velocity
+**              direction; the chaser approaches the ISS forward port from
+**              +V-bar), +X cross-track.
+**   sensor (S) the relative-pose sensor's own axes, boresight +Z.
+**
+** Quaternions are (x, y, z, w) and rotate vectors from the second-named frame
+** into the first: StQuat = q_L_B, so v_L = q ⊗ v_B ⊗ q*.
 */
 typedef struct
 {
-    float  CycleDt_s;         /* sim time covered by one GNC cycle (s)                 */
-    float  Range_m;           /* port-face to port-face distance                       */
-    float  ClosingSpeed_ms;   /* + = closing                                           */
-    float  LateralOffset_m;   /* port distance from the docking axis                   */
-    float  AttitudeError_deg; /* cone angle between port axes                          */
-    float  RelPos_X;          /* chaser origin - target origin, world frame (m)        */
-    float  RelPos_Y;
-    float  RelPos_Z;
-    float  RelVel_X;          /* chaser - target velocity, world frame (m/s)           */
-    float  RelVel_Y;
-    float  RelVel_Z;
-    float  AngVel_X;          /* chaser angular rate, chaser-port frame (rad/s)        */
-    float  AngVel_Y;
-    float  AngVel_Z;
-    uint32 Flags;             /* SIMLINK_FLAG_*                                        */
-    float  PitchError_deg;    /* per-axis attitude error [-180,180], 0 = aligned       */
-    float  YawError_deg;
-    float  RollError_deg;
-    float  LatOffset_X;       /* signed port lateral offset, world X/Y (m)             */
-    float  LatOffset_Y;
-    float  Thc[3];            /* crew translation hand controller, body X/Y/Z, -1..+1  */
-    float  Rhc[3];            /* crew rotation hand controller, body X/Y/Z (pitch/yaw/
-                              ** roll), -1..+1                                          */
+    float  CycleDt_s;   /* sim time covered by one GNC cycle (s)                         */
+    uint32 SensorValid; /* SIMLINK_SENSOR_*                                              */
+
+    /* IMU (at the CoM) */
+    float GyroRate_B[3]; /* body angular rate (rad/s)                                     */
+    float DeltaV_B[3];   /* non-gravitational velocity change over the cycle that just
+                         ** ended (m/s) — thrust and contact; free fall reads zero        */
+
+    /* Star tracker */
+    float StQuat[4]; /* q_L_B, body attitude in LVLH (x, y, z, w)                         */
+
+    /* Relative-pose sensor (LIDAR): line of sight to the target docking port's
+    ** reflector, sensor frame. Az = atan2(x, z), El = asin(y / range). */
+    float RpsRange_m;
+    float RpsAz_rad;
+    float RpsEl_rad;
+
+    uint32 MechFlags; /* SIMLINK_MECH_*                                                    */
+
+    float Thc[3]; /* crew translation hand controller, body X/Y/Z, -1..+1                */
+    float Rhc[3]; /* crew rotation hand controller, body X/Y/Z (pitch/yaw/roll), -1..+1  */
 } SIMLINK_SimState_t;
 
 /*
@@ -110,7 +122,7 @@ typedef struct
 
 _Static_assert(sizeof(SIMLINK_Header_t) == 24, "SimLink header layout changed");
 _Static_assert(sizeof(SIMLINK_Trailer_t) == 4, "SimLink trailer layout changed");
-_Static_assert(sizeof(SIMLINK_SimState_t) == 104, "SimLink SIM_STATE layout changed");
+_Static_assert(sizeof(SIMLINK_SimState_t) == 88, "SimLink SIM_STATE layout changed");
 _Static_assert(sizeof(SIMLINK_ThrusterCmd_t) == 72, "SimLink THRUSTER_CMD layout changed");
 
 /* CRC-16/CCITT-FALSE: poly 0x1021, init 0xFFFF, no reflection, no final XOR. */

@@ -37,6 +37,7 @@ HS_AMTEntry_t HS_AppMon_Tbl[HS_MAX_MONITORED_APPS] = {
     /*   8 */ {"LC",       0, 10, HS_AMTActType_EVENT},
     /*   9 */ {"SC",       0, 10, HS_AMTActType_EVENT},
     /*  10 */ {"DS",       0, 10, HS_AMTActType_EVENT},
+    /*  11 */ {"NAV",      0, 10, HS_AMTActType_EVENT},
 };
 
 CFE_TBL_FILEDEF(HS_AppMon_Tbl, HS.AppMon_Tbl, Dock HS AppMon Table, hs_amt.tbl)

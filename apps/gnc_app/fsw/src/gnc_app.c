@@ -31,10 +31,20 @@ void GNC_APP_Main(void)
         {
             case SIM_IO_SIM_STATE_MID:
             {
+                /* Hardware readings + link watchdog; NAV's solution for the
+                ** same Seq follows and runs the control cycle. */
                 size_t Size = 0;
                 CFE_MSG_GetSize(&MsgBuf->Msg, &Size);
                 if (Size == sizeof(SIM_IO_SimStateMsg_t))
                     GNC_APP_ProcessSimState((const SIM_IO_SimStateMsg_t *)MsgBuf);
+                break;
+            }
+            case NAV_SOLUTION_MID:
+            {
+                size_t Size = 0;
+                CFE_MSG_GetSize(&MsgBuf->Msg, &Size);
+                if (Size == sizeof(NAV_SolutionMsg_t))
+                    GNC_APP_ProcessNavSolution((const NAV_SolutionMsg_t *)MsgBuf);
                 break;
             }
             case SIM_IO_THRUSTER_CMD_MID:
@@ -122,6 +132,13 @@ static int32 GNC_APP_ValidateParamTbl(void *TblPtr)
                           (unsigned long)p->EntrySettleCycles);
         return GNC_APP_TBL_VALIDATE_ERR;
     }
+    if (p->LatVelAtPort > 1)
+    {
+        CFE_EVS_SendEvent(GNC_APP_TBL_VAL_ERR_EID, CFE_EVS_EventType_ERROR,
+                          "GNC_APP: table rejected — LatVelAtPort %lu is not 0 or 1",
+                          (unsigned long)p->LatVelAtPort);
+        return GNC_APP_TBL_VALIDATE_ERR;
+    }
 
     return CFE_SUCCESS;
 }
@@ -162,8 +179,8 @@ CFE_Status_t GNC_APP_Init(void)
     GNC_APP_Data.LcSampleCmd.Payload.EndIndex   = GNC_APP_LC_CYCLE_AP_LAST;
     GNC_APP_Data.LcSampleCmd.Payload.UpdateAge  = 0;
 
-    /* 3. Create SB pipe and subscribe: vehicle state (the cycle trigger),
-    **    1 Hz HK request, and ground commands. */
+    /* 3. Create SB pipe and subscribe: NAV solution (the cycle trigger), the
+    **    sim hardware readings, RCS's answer, 1 Hz HK request, ground commands. */
     status = CFE_SB_CreatePipe(&GNC_APP_Data.CmdPipe, GNC_APP_PIPE_DEPTH, GNC_APP_PIPE_NAME);
     if (status != CFE_SUCCESS)
     {
@@ -201,6 +218,14 @@ CFE_Status_t GNC_APP_Init(void)
     {
         CFE_EVS_SendEvent(GNC_APP_SUB_ERR_EID, CFE_EVS_EventType_ERROR,
                           "GNC_APP: subscribe to THRUSTER_CMD failed, RC=0x%08lX", (unsigned long)status);
+        return status;
+    }
+
+    status = CFE_SB_Subscribe(CFE_SB_ValueToMsgId(NAV_SOLUTION_MID), GNC_APP_Data.CmdPipe);
+    if (status != CFE_SUCCESS)
+    {
+        CFE_EVS_SendEvent(GNC_APP_SUB_ERR_EID, CFE_EVS_EventType_ERROR,
+                          "GNC_APP: subscribe to NAV_SOLUTION failed, RC=0x%08lX", (unsigned long)status);
         return status;
     }
 
@@ -251,7 +276,7 @@ CFE_Status_t GNC_APP_Init(void)
     }
 
     CFE_EVS_SendEvent(GNC_APP_INIT_INF_EID, CFE_EVS_EventType_INFORMATION,
-                      "GNC_APP initialized (lock-step on SIM_STATE). "
+                      "GNC_APP initialized (lock-step on NAV_SOLUTION). "
                       "Guidance INHIBITED — send GO to start.");
 
     return CFE_SUCCESS;
@@ -270,10 +295,11 @@ CFE_Status_t GNC_APP_Init(void)
 /* always operates on a consistent, up-to-date phase value.                  */
 /*                                                                           */
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
-static GNC_Phase_t GNC_APP_SelectPhase(const GNC_APP_UnityTlm_t *tlm, GNC_Phase_t current)
+static GNC_Phase_t GNC_APP_SelectPhase(const GNC_APP_Input_t *tlm, GNC_Phase_t current)
 {
-    /* Docked check is unconditional — highest priority inhibit */
-    if (tlm->Flags & 0x2)
+    /* Docked check is unconditional — highest priority inhibit. The capture
+    ** latch switch is a mechanism sensor, not a navigation estimate. */
+    if (tlm->Captured)
         return GNC_PHASE_DOCKED;
 
     /* Once docked, stay docked until the scenario is reset (cFS restart) */
@@ -323,6 +349,18 @@ static GNC_Phase_t GNC_APP_SelectPhase(const GNC_APP_UnityTlm_t *tlm, GNC_Phase_
     GNC_Phase_t next = (current == GNC_PHASE_IDLE) ? GNC_PHASE_CORRECT : current;
 
     /*
+    ** Every gate below judges NAV's relative solution. While it is unusable
+    ** (LIDAR not yet converged, or lost long enough for the covariance to grow
+    ** past NAV's limits) there is nothing to judge: hold the phase and restart
+    ** the settle count. ComputeControl coasts translation meanwhile.
+    */
+    if (!tlm->RelNavValid || !tlm->AttValid || !tlm->RateValid)
+    {
+        GNC_APP_Data.SettleCounter = 0;
+        return next;
+    }
+
+    /*
     ** Lateral offset gate with hysteresis.
     **
     ** Entry (CORRECT -> APPROACH) uses a fixed absolute threshold: initial
@@ -355,8 +393,8 @@ static GNC_Phase_t GNC_APP_SelectPhase(const GNC_APP_UnityTlm_t *tlm, GNC_Phase_
         if (next == GNC_PHASE_CORRECT)
         {
             bool posOk = tlm->LateralOffset_m < p->LatEntryThreshold_m;
-            bool velOk = fabsf(tlm->RelVel_X) < p->LatEntryVelMax_ms &&
-                         fabsf(tlm->RelVel_Y) < p->LatEntryVelMax_ms;
+            bool velOk = fabsf(tlm->LatVel_X) < p->LatEntryVelMax_ms &&
+                         fabsf(tlm->LatVel_Y) < p->LatEntryVelMax_ms;
             bool rateOk = fabsf(tlm->AngVel_X) < p->AttEntryRateMax_rads &&
                           fabsf(tlm->AngVel_Y) < p->AttEntryRateMax_rads &&
                           fabsf(tlm->AngVel_Z) < p->AttEntryRateMax_rads;
@@ -537,7 +575,7 @@ static void GNC_APP_SanitizeControl(GNC_Control_t *ctrl)
 /*        to fake by writing Rigidbody velocities directly).                 */
 /*                                                                           */
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
-static void GNC_APP_ManualControl(const GNC_APP_UnityTlm_t *tlm, const GNC_ParamTbl_t *p, float dt,
+static void GNC_APP_ManualControl(const GNC_APP_Input_t *tlm, const GNC_ParamTbl_t *p, float dt,
                                   float dv[3], float dw[3])
 {
     const float rate[3] = {tlm->AngVel_X, tlm->AngVel_Y, tlm->AngVel_Z};
@@ -554,8 +592,12 @@ static void GNC_APP_ManualControl(const GNC_APP_UnityTlm_t *tlm, const GNC_Param
 
         dv[i] = thc * p->ManualAccel_mss * dt;
 
-        float w_err = rhc * p->ManualRate_rads - rate[i];
-        dw[i]       = (fabsf(w_err) < p->ManualRateDeadband_rads) ? 0.0f : w_err;
+        /* Rate command needs the gyro: without it there is no rate to hold */
+        if (tlm->RateValid)
+        {
+            float w_err = rhc * p->ManualRate_rads - rate[i];
+            dw[i]       = (fabsf(w_err) < p->ManualRateDeadband_rads) ? 0.0f : w_err;
+        }
     }
 }
 
@@ -589,7 +631,7 @@ static void GNC_APP_ManualControl(const GNC_APP_UnityTlm_t *tlm, const GNC_Param
 /* Reads only from the caller's local copy of tlm — no shared state.        */
 /*                                                                           */
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
-static GNC_Control_t GNC_APP_ComputeControl(const GNC_APP_UnityTlm_t *tlm, GNC_Phase_t phase, float dt)
+static GNC_Control_t GNC_APP_ComputeControl(const GNC_APP_Input_t *tlm, GNC_Phase_t phase, float dt)
 {
     GNC_Control_t         ctrl = {0};
     const GNC_ParamTbl_t *p    = GNC_APP_Data.ParamTblPtr;
@@ -679,10 +721,20 @@ static GNC_Control_t GNC_APP_ComputeControl(const GNC_APP_UnityTlm_t *tlm, GNC_P
     /* === Channel 2 — Lateral position + velocity (X and Y) =========== */
     /* Steers on the docking-PORT-relative LatOffset_X/Y (not the chaser  */
     /* origin), so rotation that sweeps the port off-axis is seen. The    */
-    /* velocity term still reads the origin's RelVel (roadmap phase 4:    */
-    /* port point-velocity from the NAV app).                             */
-    dv[0] = GNC_APP_LateralAxis(tlm->LatOffset_X, tlm->RelVel_X, ff_x, phase, p);
-    dv[1] = GNC_APP_LateralAxis(tlm->LatOffset_Y, tlm->RelVel_Y, ff_y, phase, p);
+    /* velocity term is the port point velocity v_cm + ω×r from NAV       */
+    /* (realism phase 4), or the CoM velocity if LatVelAtPort = 0.        */
+    dv[0] = GNC_APP_LateralAxis(tlm->LatOffset_X, tlm->LatVel_X, ff_x, phase, p);
+    dv[1] = GNC_APP_LateralAxis(tlm->LatOffset_Y, tlm->LatVel_Y, ff_y, phase, p);
+
+    /* No usable relative solution (NAV not converged, or LIDAR lost long
+    ** enough): coast in translation rather than steer on a guess. Attitude
+    ** control below needs only the star tracker and gyro. */
+    if (!tlm->RelNavValid)
+    {
+        dv[0] = 0.0f;
+        dv[1] = 0.0f;
+        dv[2] = 0.0f;
+    }
 
     /* === Channel 3 — Attitude (all active phases) ====================== */
     /*                                                                      */
@@ -708,7 +760,21 @@ static GNC_Control_t GNC_APP_ComputeControl(const GNC_APP_UnityTlm_t *tlm, GNC_P
                          fabsf(tlm->YawError_deg)   < att_db_deg &&
                          fabsf(tlm->RollError_deg)  < att_db_deg;
 
-        if (!(in_db && !spinning))
+        if (!tlm->RateValid)
+        {
+            /* No gyro: neither the rate term nor a safe correction exists */
+        }
+        else if (!tlm->AttValid)
+        {
+            /* No attitude: hold rates at zero until the star tracker is back */
+            if (spinning)
+            {
+                dw[0] = -tlm->AngVel_X;
+                dw[1] = -tlm->AngVel_Y;
+                dw[2] = -tlm->AngVel_Z;
+            }
+        }
+        else if (!(in_db && !spinning))
         {
             dw[0] = GNC_APP_AttitudeAxis(tlm->PitchError_deg, tlm->AngVel_X, p);
             dw[1] = GNC_APP_AttitudeAxis(tlm->YawError_deg,   tlm->AngVel_Y, p);
@@ -737,9 +803,11 @@ to_impulse:
 /* Compares the axial impulse the RCS app actually commanded on the         */
 /* *previous* cycle (its THRUSTER_CMD AchievedLinImpulse — after saturation  */
 /* and minimum-impulse-bit effects, so a legitimately clipped burn isn't a   */
-/* false alarm) against the ClosingSpeed_ms change observed this cycle.      */
-/* A commanded burn with almost no corresponding velocity change is the      */
-/* signature of a failed/weak thruster or a table-vs-vehicle mismatch.       */
+/* false alarm) against the body +Z Δv the IMU accelerometer measured over  */
+/* the cycle that burn covered (realism phase 4; before, the closing-speed   */
+/* change, which rotation and gravity also move). A commanded burn with      */
+/* almost no corresponding Δv is the signature of a failed/weak thruster or  */
+/* a table-vs-vehicle mismatch.                                              */
 /*                                                                           */
 /* Measurement only (realism phase 3): GNC publishes the consecutive-cycle   */
 /* streak in the STATE packet and takes no action itself. The decision —     */
@@ -748,11 +816,12 @@ to_impulse:
 /* the flight rules can change without a GNC code change.                    */
 /*                                                                           */
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
-static void GNC_APP_CheckActuatorHealth(const GNC_APP_UnityTlm_t *tlm, const GNC_ParamTbl_t *p)
+static void GNC_APP_CheckActuatorHealth(const GNC_APP_Input_t *tlm, const GNC_ParamTbl_t *p)
 {
-    /* Nothing to check: no THRUSTER_CMD matched the previous cycle, or the
-       Seq was discontinuous (sim time passed that no command covered). */
-    if (!GNC_APP_Data.PrevBurnValid)
+    /* Nothing to check: no THRUSTER_CMD matched the previous cycle, the Seq
+       was discontinuous (sim time passed that no command covered), or the
+       IMU gave no Δv this cycle. */
+    if (!GNC_APP_Data.PrevBurnValid || !tlm->DvValid)
     {
         GNC_APP_Data.UnderDeliveryStreak = 0;
         return;
@@ -768,7 +837,7 @@ static void GNC_APP_CheckActuatorHealth(const GNC_APP_UnityTlm_t *tlm, const GNC
         return;
     }
 
-    float observed_dv        = tlm->ClosingSpeed_ms - GNC_APP_Data.PrevClosingSpeed_ms;
+    float observed_dv        = tlm->DeltaV_B[2];
     float delivered_fraction = observed_dv / predicted_dv;  /* same-sign & near 1.0 is healthy */
 
     if (delivered_fraction < 0.5f)
@@ -795,11 +864,12 @@ static uint8 GNC_APP_Flags(void)
     if (GNC_APP_Data.HoldPt1Armed)   f |= GNC_APP_FLAG_HOLDPT1_ARMED;
     if (GNC_APP_Data.HoldPt2Armed)   f |= GNC_APP_FLAG_HOLDPT2_ARMED;
     if (GNC_APP_Data.BadCtrlLatched) f |= GNC_APP_FLAG_BAD_CTRL;
+    if (GNC_APP_Data.NavInvalidLatched) f |= GNC_APP_FLAG_NAV_INVALID;
     if (GNC_APP_Data.HaveTlm)
     {
         f |= GNC_APP_FLAG_LINK_UP;
-        if (GNC_APP_Data.LatestTlm.Flags & SIMLINK_FLAG_IN_CORRIDOR) f |= GNC_APP_FLAG_IN_CORRIDOR;
-        if (GNC_APP_Data.LatestTlm.Flags & SIMLINK_FLAG_DOCKED)      f |= GNC_APP_FLAG_CONTACT;
+        if (GNC_APP_Data.InCorridor)          f |= GNC_APP_FLAG_IN_CORRIDOR;
+        if (GNC_APP_Data.LatestIn.Captured)   f |= GNC_APP_FLAG_CONTACT;
     }
     return f;
 }
@@ -814,10 +884,10 @@ static uint8 GNC_APP_Flags(void)
 /* STATE just produced — LC's pipe is FIFO, so the STATE is processed first. */
 /*                                                                           */
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
-static void GNC_APP_PublishState(const SIM_IO_SimStateMsg_t *Msg, const GNC_Control_t *ctrl)
+static void GNC_APP_PublishState(const NAV_SolutionMsg_t *Msg, const GNC_APP_Input_t *tlm,
+                                 const GNC_Control_t *ctrl)
 {
-    GNC_APP_StateTlm_t       *st  = &GNC_APP_Data.StateTlm;
-    const GNC_APP_UnityTlm_t *tlm = &Msg->State;
+    GNC_APP_StateTlm_t *st = &GNC_APP_Data.StateTlm;
 
     st->SimTime_s            = Msg->SimTime_s;
     st->Seq                  = Msg->Seq;
@@ -857,11 +927,104 @@ static void GNC_APP_PublishState(const SIM_IO_SimStateMsg_t *Msg, const GNC_Cont
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 /*                                                                           */
-/* GNC_APP_ProcessSimState — one lock-step control cycle                     */
+/* GNC_APP_ProcessSimState — sim hardware readings + link watchdog           */
 /*                                                                           */
-/* Runs once per SIM_STATE published by SIM_IO. Unity is blocked waiting for */
-/* the answer, so this is the whole control cycle:                           */
-/* 1. Validate the cycle and take the state (single task — no mutex).        */
+/* SIM_STATE reaches NAV and GNC together. GNC takes from it only what is    */
+/* not navigation — the crew hand controllers and the docking-mechanism      */
+/* switches — and keeps them until NAV's solution for the same Seq arrives   */
+/* and runs the cycle (GNC_APP_ProcessNavSolution). Its arrival is also what */
+/* proves the sim link alive for the LC link-loss watchpoint (TlmStaleSec).  */
+/*                                                                           */
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+void GNC_APP_ProcessSimState(const SIM_IO_SimStateMsg_t *Msg)
+{
+    GNC_APP_Data.HkTlm.SimStateCount++;
+    GNC_APP_Data.HaveTlm        = true;
+    GNC_APP_Data.TlmSinceLastHk = true;
+
+    /* Informational only — whether the outage was long enough to abort is
+    ** LC's call (actionpoint 0), and GO is still the operator's. */
+    if (GNC_APP_Data.HkTlm.TlmStaleSec >= GNC_LINK_RESTORED_EVT_SEC)
+    {
+        CFE_EVS_SendEvent(GNC_APP_LINK_INF_EID, CFE_EVS_EventType_INFORMATION,
+                          "GNC_APP: sim link restored at Seq %lu after %lu s",
+                          (unsigned long)Msg->Seq, (unsigned long)GNC_APP_Data.HkTlm.TlmStaleSec);
+    }
+    GNC_APP_Data.HkTlm.TlmStaleSec = 0;
+
+    GNC_APP_Data.HwSeq = Msg->Seq;
+    memcpy(GNC_APP_Data.HwThc, Msg->State.Thc, sizeof(GNC_APP_Data.HwThc));
+    memcpy(GNC_APP_Data.HwRhc, Msg->State.Rhc, sizeof(GNC_APP_Data.HwRhc));
+    GNC_APP_Data.HwMechFlags = Msg->State.MechFlags;
+}
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+/*                                                                           */
+/* GNC_APP_BuildInput — NAV solution + hardware readings -> control input    */
+/*                                                                           */
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+static void GNC_APP_BuildInput(const NAV_SolutionMsg_t *Msg, GNC_APP_Input_t *in)
+{
+    const GNC_ParamTbl_t *p       = GNC_APP_Data.ParamTblPtr;
+    const float           RAD2DEG = 57.29578f;
+
+    memset(in, 0, sizeof(*in));
+
+    in->Range_m         = Msg->Range_m;
+    in->ClosingSpeed_ms = Msg->ClosingSpeed_ms;
+    in->LateralOffset_m = Msg->LateralOffset_m;
+    in->LatOffset_X     = Msg->PortPos_D[0];
+    in->LatOffset_Y     = Msg->PortPos_D[1];
+    if (p->LatVelAtPort)
+    {
+        in->LatVel_X = Msg->PortVel_D[0];
+        in->LatVel_Y = Msg->PortVel_D[1];
+    }
+    else
+    {
+        in->LatVel_X = Msg->CmVel_L[0];
+        in->LatVel_Y = Msg->CmVel_L[1];
+    }
+    in->RelPos_X       = Msg->CmPos_L[0];
+    in->RelPos_Y       = Msg->CmPos_L[1];
+    in->RelPos_Z       = Msg->CmPos_L[2];
+    in->RelVel_X       = Msg->CmVel_L[0];
+    in->RelVel_Y       = Msg->CmVel_L[1];
+    in->RelVel_Z       = Msg->CmVel_L[2];
+    in->AngVel_X       = Msg->AngRate_B[0];
+    in->AngVel_Y       = Msg->AngRate_B[1];
+    in->AngVel_Z       = Msg->AngRate_B[2];
+    in->PitchError_deg = Msg->AttErr_B[0] * RAD2DEG;
+    in->YawError_deg   = Msg->AttErr_B[1] * RAD2DEG;
+    in->RollError_deg  = Msg->AttErr_B[2] * RAD2DEG;
+    memcpy(in->DeltaV_B, Msg->DeltaV_B, sizeof(in->DeltaV_B));
+    in->RelNavValid = (Msg->Status & NAV_STATUS_RELNAV_VALID) != 0;
+    in->AttValid    = (Msg->Status & NAV_STATUS_ATT_VALID) != 0;
+    in->RateValid   = (Msg->Status & NAV_STATUS_RATE_VALID) != 0;
+    in->DvValid     = (Msg->Status & NAV_STATUS_DV_VALID) != 0;
+
+    /* Sticks only from the SIM_STATE of this same cycle — never act on a stale
+    ** deflection. The capture latch is a latched mechanism state, so the
+    ** last reading stands. */
+    if (GNC_APP_Data.HaveTlm && GNC_APP_Data.HwSeq == Msg->Seq)
+    {
+        memcpy(in->Thc, GNC_APP_Data.HwThc, sizeof(in->Thc));
+        memcpy(in->Rhc, GNC_APP_Data.HwRhc, sizeof(in->Rhc));
+    }
+    else
+    {
+        GNC_APP_Data.HwSeqMismatches++;
+    }
+    in->Captured = (GNC_APP_Data.HwMechFlags & SIMLINK_MECH_CAPTURE) != 0;
+}
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+/*                                                                           */
+/* GNC_APP_ProcessNavSolution — one lock-step control cycle                  */
+/*                                                                           */
+/* Runs once per NAV_SOLUTION (NAV runs once per SIM_STATE). Unity is        */
+/* blocked waiting for the answer, so this is the whole control cycle:       */
+/* 1. Validate the cycle and assemble the input (single task — no mutex).    */
 /* 2. Run the phase state machine.                                           */
 /* 3. Run the control law and publish ACT_REQ tagged with this Seq.          */
 /* 4. Publish the STATE packet and request the LC cycle-rate AP sample.      */
@@ -871,13 +1034,13 @@ static void GNC_APP_PublishState(const SIM_IO_SimStateMsg_t *Msg, const GNC_Cont
 /* since its TlmStaleSec is what LC watches for sim-link loss.               */
 /*                                                                           */
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
-void GNC_APP_ProcessSimState(const SIM_IO_SimStateMsg_t *Msg)
+void GNC_APP_ProcessNavSolution(const NAV_SolutionMsg_t *Msg)
 {
     static const char *const PHASE_NAMES[] = {"IDLE", "LAT_CORR", "APPROACH", "DOCKED", "HOLD", "MANUAL"};
 
-    GNC_APP_UnityTlm_t tlm;
-    GNC_Control_t      ctrl = {0};
-    float              dt   = Msg->State.CycleDt_s;
+    GNC_APP_Input_t tlm;
+    GNC_Control_t   ctrl = {0};
+    float           dt   = Msg->CycleDt_s;
 
     GNC_APP_Data.HkTlm.CycleCount++;
 
@@ -922,29 +1085,37 @@ void GNC_APP_ProcessSimState(const SIM_IO_SimStateMsg_t *Msg)
     if (!(dt >= GNC_MIN_CYCLE_DT_S && dt <= GNC_MAX_CYCLE_DT_S))
     {
         CFE_EVS_SendEvent(GNC_APP_BAD_DT_EID, CFE_EVS_EventType_ERROR,
-                          "GNC_APP: SIM_STATE Seq %lu CycleDt_s %g out of range — coasting",
+                          "GNC_APP: NAV_SOLUTION Seq %lu CycleDt_s %g out of range — coasting",
                           (unsigned long)Msg->Seq, (double)dt);
         GNC_APP_PublishCommand(&ctrl, Msg->Seq);
         GNC_APP_Data.PrevBurnValid = false;
         return;
     }
 
-    GNC_APP_Data.HkTlm.SimStateCount++;
+    GNC_APP_BuildInput(Msg, &tlm);
+    GNC_APP_Data.LatestIn = tlm;
 
-    memcpy(&tlm, &Msg->State, sizeof(tlm));
-    GNC_APP_Data.LatestTlm      = tlm;
-    GNC_APP_Data.HaveTlm        = true;
-    GNC_APP_Data.TlmSinceLastHk = true;
-
-    /* Informational only — whether the outage was long enough to abort is
-    ** LC's call (actionpoint 0), and GO is still the operator's. */
-    if (GNC_APP_Data.HkTlm.TlmStaleSec >= GNC_LINK_RESTORED_EVT_SEC)
+    /* NAV's relative solution becoming unusable (or usable again) changes what
+    ** the control law can do — say so once per transition. */
+    if (tlm.RelNavValid == GNC_APP_Data.NavInvalidLatched)
     {
-        CFE_EVS_SendEvent(GNC_APP_LINK_INF_EID, CFE_EVS_EventType_INFORMATION,
-                          "GNC_APP: sim link restored at Seq %lu after %lu s",
-                          (unsigned long)Msg->Seq, (unsigned long)GNC_APP_Data.HkTlm.TlmStaleSec);
+        if (tlm.RelNavValid)
+            CFE_EVS_SendEvent(GNC_APP_NAV_INF_EID, CFE_EVS_EventType_INFORMATION,
+                              "GNC_APP: NAV relative solution usable — translation control enabled");
+        else
+            CFE_EVS_SendEvent(GNC_APP_NAV_INF_EID, CFE_EVS_EventType_ERROR,
+                              "GNC_APP: NAV relative solution NOT usable — translation coasts, attitude held");
     }
-    GNC_APP_Data.HkTlm.TlmStaleSec = 0;
+    GNC_APP_Data.NavInvalidLatched = !tlm.RelNavValid;
+
+    /* Inside the approach cone? (the same corridor radius SelectPhase reverts on) */
+    {
+        const GNC_ParamTbl_t *p       = GNC_APP_Data.ParamTblPtr;
+        float                 allowed = tlm.Range_m * tanf(p->ConeHalfAngle_deg * GNC_DEG2RAD);
+        if (allowed < p->MinAllowedLateral_m)
+            allowed = p->MinAllowedLateral_m;
+        GNC_APP_Data.InCorridor = tlm.RelNavValid && tlm.LateralOffset_m <= allowed;
+    }
 
     /* A Seq discontinuity (Unity ran free, or restarted) means sim time passed
     ** that the previous command didn't cover — drop the actuator-health
@@ -977,8 +1148,8 @@ void GNC_APP_ProcessSimState(const SIM_IO_SimStateMsg_t *Msg)
 
     GNC_APP_Data.HkTlm.Phase = (uint8)GNC_APP_Data.Phase;
 
-    /* Check the previous cycle's axial burn against what actually happened
-       this cycle, before overwriting Prev* with this cycle's command below. */
+    /* Check the previous cycle's axial burn against the Δv the IMU measured
+       over that cycle, before overwriting Prev* with this cycle's command. */
     GNC_APP_CheckActuatorHealth(&tlm, GNC_APP_Data.ParamTblPtr);
 
     /* Run the control law for the active phase and request the impulse */
@@ -987,23 +1158,20 @@ void GNC_APP_ProcessSimState(const SIM_IO_SimStateMsg_t *Msg)
 
     /* Health baseline for next cycle: PrevBurnValid is set again only once the
     ** RCS's THRUSTER_CMD answering this Seq arrives with the achieved impulse. */
-    GNC_APP_Data.PrevBurnValid       = false;
-    GNC_APP_Data.PrevClosingSpeed_ms = tlm.ClosingSpeed_ms;
+    GNC_APP_Data.PrevBurnValid = false;
 
-    GNC_APP_PublishState(Msg, &ctrl);
-
-    int inCorridor = (tlm.Flags & SIMLINK_FLAG_IN_CORRIDOR) != 0;
-    int docked     = (tlm.Flags & SIMLINK_FLAG_DOCKED) != 0;
+    GNC_APP_PublishState(Msg, &tlm, &ctrl);
 
     /* Per-cycle one-liner, now a DEBUG event: the STATE packet above is the
     ** data channel (ground console, DS recorder). EVS filters DEBUG out by
     ** default; enable it for a console trace with EVS ENABLE_APP_EVENT_TYPE
     ** (GNC_APP, DEBUG) — see Docs/OPERATIONS.md.
-    ** PYR = pitch/yaw/roll error (deg), W = body rates (rad/s),
+    ** PYR = pitch/yaw/roll error (deg), W = body rates (rad/s), C/D = in
+    ** corridor / captured, N = NAV relative solution usable,
     ** P = linear impulse request (N·s), L = angular impulse request (N·m·s). */
     CFE_EVS_SendEvent(GNC_APP_WAKEUP_INF_EID, CFE_EVS_EventType_DEBUG,
                       "GNC #%u [%s] Rng=%.2f Spd=%.3f Lat=%.3f "
-                      "PYR=%.1f/%.1f/%.1f W=%.3f/%.3f/%.3f C%dD%d "
+                      "PYR=%.1f/%.1f/%.1f W=%.3f/%.3f/%.3f C%dD%dN%d "
                       "P=%.0f/%.0f/%.0f L=%.0f/%.0f/%.0f",
                       (unsigned int)GNC_APP_Data.HkTlm.CycleCount,
                       PHASE_NAMES[GNC_APP_Data.Phase],
@@ -1016,7 +1184,7 @@ void GNC_APP_ProcessSimState(const SIM_IO_SimStateMsg_t *Msg)
                       (double)tlm.AngVel_X,
                       (double)tlm.AngVel_Y,
                       (double)tlm.AngVel_Z,
-                      inCorridor, docked,
+                      (int)GNC_APP_Data.InCorridor, (int)tlm.Captured, (int)tlm.RelNavValid,
                       (double)ctrl.Px, (double)ctrl.Py, (double)ctrl.Pz,
                       (double)ctrl.Lx, (double)ctrl.Ly, (double)ctrl.Lz);
 }
@@ -1129,8 +1297,8 @@ void GNC_APP_ProcessCmd(CFE_SB_Buffer_t *MsgBuf)
             GNC_APP_Data.HkTlm.CmdCount++;
             GNC_APP_Data.Phase          = GNC_PHASE_HOLD;
             GNC_APP_Data.HkTlm.Phase    = (uint8)GNC_PHASE_HOLD;
-            /* LatestTlm is owned by this task — no mutex needed */
-            float rng = GNC_APP_Data.LatestTlm.Range_m;
+            /* LatestIn is owned by this task — no mutex needed */
+            float rng = GNC_APP_Data.LatestIn.Range_m;
             GNC_APP_Data.HoldRange_m    = rng;
             CFE_EVS_SendEvent(GNC_APP_HOLD_INF_EID, CFE_EVS_EventType_INFORMATION,
                               "GNC_APP: HOLD — station-keep at %.2f m (await GO)", (double)rng);

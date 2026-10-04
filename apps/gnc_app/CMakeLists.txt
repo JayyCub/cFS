@@ -4,9 +4,12 @@ add_cfe_app(gnc_app
     fsw/src/gnc_app.c
 )
 
-# sim_io/fsw/inc: SIM_STATE (input) and THRUSTER_CMD (actuator-health check);
-# rcs/fsw/inc: ACT_REQ (GNC output). GNC owns no sockets and no thruster data.
-target_include_directories(gnc_app PUBLIC fsw/inc fsw/src ${sim_io_MISSION_DIR}/fsw/inc ${rcs_MISSION_DIR}/fsw/inc)
+# nav/fsw/inc: NAV_SOLUTION (the vehicle state GNC flies on, and the cycle trigger);
+# sim_io/fsw/inc: SIM_STATE (hand controllers, mechanism switches, link watchdog)
+# and THRUSTER_CMD (actuator-health check); rcs/fsw/inc: ACT_REQ (GNC output).
+# GNC owns no sockets, no sensors and no thruster data.
+target_include_directories(gnc_app PUBLIC fsw/inc fsw/src ${nav_MISSION_DIR}/fsw/inc ${sim_io_MISSION_DIR}/fsw/inc
+                                          ${rcs_MISSION_DIR}/fsw/inc)
 
 # lc: GNC closes each control cycle with an LC_SAMPLE_AP request for its
 # cycle-rate actionpoint group (headers only — no link-time dependency).

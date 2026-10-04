@@ -71,6 +71,7 @@ SCH_LAB_ScheduleTable_t SCH_TBL_Structure =
                                                                       cycle runs lock-step on SIM_IO SIM_STATE. */
         {CFE_SB_MSGID_WRAP_VALUE(0x1897),                 10, 0}, /* SIM_IO_SEND_HK_MID, 1 Hz */
         {CFE_SB_MSGID_WRAP_VALUE(0x18A2),                 10, 0}, /* RCS_SEND_HK_MID, 1 Hz (also RCS table manage) */
+        {CFE_SB_MSGID_WRAP_VALUE(0x18D1),                 10, 0}, /* NAV_SEND_HK_MID, 1 Hz (also NAV table manage) */
         /* LC wall-clock actionpoint group: AP 0 (sim link loss) must evaluate
         ** while no SIM_STATE arrives, so it is sampled here at 1 Hz rather than
         ** by gnc_app's per-cycle request (which samples APs 1..1). Payload =

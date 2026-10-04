@@ -9,6 +9,8 @@
 #include "gnc_app_tbl.h"
 #include "sim_io_msgids.h"
 #include "sim_io_msg.h"
+#include "nav_msgids.h"
+#include "nav_msg.h"
 #include "rcs_msgids.h"
 #include "rcs_msg.h"
 #include "lc_msgids.h"
@@ -17,10 +19,13 @@
 /*
 ** Pipe configuration
 **
-** GNC owns no sockets and knows nothing about individual thrusters: vehicle
-** state arrives as SIM_IO_SIM_STATE_MID, and each cycle GNC publishes the
-** impulse it wants (RCS_ACT_REQ_MID) for the RCS app to allocate to thrusters.
-** SIM_STATE arrival IS the control-cycle trigger (lock-step with the sim).
+** GNC owns no sockets, no sensors and knows nothing about individual
+** thrusters: the vehicle state is the NAV app's solution (NAV_SOLUTION_MID),
+** and each cycle GNC publishes the impulse it wants (RCS_ACT_REQ_MID) for the
+** RCS app to allocate to thrusters. NAV_SOLUTION arrival IS the control-cycle
+** trigger (lock-step: SIM_IO -> NAV -> GNC). From SIM_IO's SIM_STATE GNC reads
+** only the crew hand controllers and the docking-mechanism switches, plus its
+** arrival for the sim-link watchdog.
 */
 #define GNC_APP_PIPE_NAME  "GNC_CMD_PIPE"
 #define GNC_APP_PIPE_DEPTH 32
@@ -55,10 +60,8 @@
 **
 ** The lateral channel commands a target lateral velocity proportional to the
 ** lateral position error, then fires burns to track that velocity — identical
-** in structure to the axial channel.  Pos_X and Pos_Y serve as lateral errors
-** under the assumption that the target's docking axis runs through the world
-** origin (valid for this fixed-target simulation).  A moving-target upgrade
-** would replace these with port-relative lateral offsets in the telemetry.
+** in structure to the axial channel. The lateral errors are NAV's docking-port
+** offsets from the docking axis (LatOffset_X/Y, docking frame).
 */
 #define GNC_LAT_KP           0.05f   /* commanded lateral speed = KP_LAT * position error (m/s per m) */
 #define GNC_MAX_LAT_SPEED    0.10f   /* lateral speed cap — prevents aggressive cross-track burns (m/s) */
@@ -66,8 +69,8 @@
 /*
 ** Phase gate thresholds — hysteresis pair that prevents rapid phase bouncing.
 **
-** The GNC uses LateralOffset_m (Unity-computed perpendicular distance from the
-** docking axis) as the gate signal.  Hysteresis is intentional: once the
+** The GNC uses LateralOffset_m (NAV's port distance from the docking axis) as
+** the gate signal.  Hysteresis is intentional: once the
 ** approach phase is entered the chaser will not revert to lateral-correct unless
 ** the offset grows significantly, avoiding nuisance re-entries on small transients.
 */
@@ -78,7 +81,7 @@
 ** Attitude PD controller gains
 **
 ** AttKp maps attitude error (radians) to a target angular rate (rad/s).
-** The D term is provided implicitly by AngVel in the telemetry — same structure
+** The D term is provided implicitly by the gyro rate AngVel — same structure
 ** as the lateral channels (omega_tgt = Kp × error; omega_err = omega_tgt − AngVel).
 ** MaxAttRate caps the commanded angular velocity on each axis.
 */
@@ -156,6 +159,7 @@
 #define GNC_APP_BAD_DT_EID        27  /* SIM_STATE CycleDt_s out of range — cycle skipped */
 #define GNC_APP_LINK_INF_EID      28  /* sim link restored after a stale period            */
 #define GNC_APP_MANUAL_INF_EID    29  /* crew hand-controller takeover                     */
+#define GNC_APP_NAV_INF_EID       30  /* NAV relative solution lost / restored             */
 
 /* Ground command function codes: gnc_app_msg.h (shared with the SC RTS tables) */
 
@@ -212,12 +216,41 @@ typedef enum
 } GNC_Phase_t;
 
 /*
-** Vehicle state input: SIMLINK_SimState_t (sim_io/fsw/inc/simlink_icd.h),
-** delivered in SIM_IO_SimStateMsg_t. RelPos/RelVel are chaser-minus-target in
-** Unity world axes (+Y radial, -Z along-track, +X cross-track) — CW feedforward
-** input only; lateral control steers on the port-relative LatOffset_X/Y.
+** Per-cycle GNC input, assembled in GNC_APP_ProcessNavSolution from the NAV
+** solution (vehicle state) and the latest SIM_STATE (crew and mechanism
+** hardware). Field names predate phase 4, when Unity sent these values
+** computed from truth; the control law reads them unchanged.
+**
+**   docking frame D: X/Y lateral, +Z toward the target port (= world axes in
+**                    this scene, nav_cfg_tbl.c)
+**   LVLH:            Unity world axes, +Y radial, -Z along-track, +X cross-track
 */
-typedef SIMLINK_SimState_t GNC_APP_UnityTlm_t;
+typedef struct
+{
+    /* NAV solution */
+    float Range_m;                   /* port to port (m)                                         */
+    float ClosingSpeed_ms;           /* port closing rate along D +Z, + = closing (m/s)          */
+    float LateralOffset_m;           /* port distance from the docking axis (m)                  */
+    float LatOffset_X, LatOffset_Y;  /* signed port lateral offset, D X/Y (m)                    */
+    float LatVel_X, LatVel_Y;        /* lateral velocity the lateral channel steers on (m/s):
+                                     ** port point (D) or CoM (LVLH), per LatVelAtPort          */
+    float RelPos_X, RelPos_Y, RelPos_Z; /* chaser CoM - target ref, LVLH (m) — CW feed-forward  */
+    float RelVel_X, RelVel_Y, RelVel_Z; /* (m/s)                                                */
+    float AngVel_X, AngVel_Y, AngVel_Z; /* gyro body rate (rad/s)                               */
+    float PitchError_deg;            /* attitude error, body X/Y/Z rotation to the docking       */
+    float YawError_deg;              /* attitude (quaternion based, NAV)                         */
+    float RollError_deg;
+    float DeltaV_B[3];               /* IMU-measured Δv over the cycle that just ended (m/s)     */
+    bool  RelNavValid;               /* relative position/velocity usable                        */
+    bool  AttValid;                  /* attitude error usable                                    */
+    bool  RateValid;                 /* AngVel usable                                            */
+    bool  DvValid;                   /* DeltaV_B usable                                          */
+
+    /* SIM_STATE hardware */
+    float Thc[3];   /* crew translation hand controller, body X/Y/Z, -1..+1 */
+    float Rhc[3];   /* crew rotation hand controller, pitch/yaw/roll, -1..+1 */
+    bool  Captured; /* soft-capture latches engaged                          */
+} GNC_APP_Input_t;
 
 /* HK and per-cycle STATE telemetry packets: gnc_app_msg.h */
 
@@ -243,22 +276,29 @@ typedef struct
                                         ** suppresses repeat GNC_APP_BAD_CTRL_EID events for the same episode */
 
     /* Axial actuator-health monitor — compares the previous cycle's commanded
-    ** axial burn against the closing-speed change actually observed this
-    ** cycle. GNC only measures (UnderDeliveryStreak, published in STATE); LC
-    ** decides when that is an anomaly and SC responds — see
-    ** GNC_APP_CheckActuatorHealth. */
+    ** axial burn against the body-axis Δv the IMU measured this cycle. GNC
+    ** only measures (UnderDeliveryStreak, published in STATE); LC decides when
+    ** that is an anomaly and SC responds — see GNC_APP_CheckActuatorHealth. */
     float              PrevAchievedPz_Ns;   /* axial impulse RCS actually commanded last cycle (N·s) */
     bool               PrevBurnValid;       /* PrevAchievedPz_Ns is valid for the previous Seq       */
-    float              PrevClosingSpeed_ms; /* ClosingSpeed_ms when that impulse was requested       */
-    uint32             UnderDeliveryStreak; /* consecutive cycles where the observed axial Δv came in
+    uint32             UnderDeliveryStreak; /* consecutive cycles where the measured axial Δv came in
                                              ** well under what PrevAchievedPz_Ns predicted */
 
-    /* Latest vehicle state (single-task ownership — no mutex needed) */
-    GNC_APP_UnityTlm_t LatestTlm;          /* most recent SIM_STATE payload                 */
+    /* Latest inputs (single-task ownership — no mutex needed) */
+    GNC_APP_Input_t    LatestIn;           /* input of the most recent control cycle         */
     bool               HaveTlm;            /* at least one SIM_STATE received                */
     bool               TlmSinceLastHk;     /* SIM_STATE seen since the previous 1 Hz HK tick */
+    bool               InCorridor;         /* port offset inside the approach cone (NAV)      */
+    bool               NavInvalidLatched;  /* NAV relative solution unusable — reported once  */
 
-    uint32             PrevSeq;            /* Seq of the previous SIM_STATE (continuity check) */
+    /* Hardware readings from the latest SIM_STATE, matched to the NAV solution by Seq */
+    uint32             HwSeq;
+    float              HwThc[3];
+    float              HwRhc[3];
+    uint32             HwMechFlags;
+    uint32             HwSeqMismatches;    /* NAV solutions with no SIM_STATE of the same Seq */
+
+    uint32             PrevSeq;            /* Seq of the previous cycle (continuity check)   */
     bool               HavePrevSeq;
 
     /* Actuator command output (SB) */
@@ -291,6 +331,7 @@ typedef struct
 void         GNC_APP_Main(void);
 CFE_Status_t GNC_APP_Init(void);
 void         GNC_APP_ProcessSimState(const SIM_IO_SimStateMsg_t *Msg);
+void         GNC_APP_ProcessNavSolution(const NAV_SolutionMsg_t *Msg);
 void         GNC_APP_SendHk(void);
 void         GNC_APP_ProcessCmd(CFE_SB_Buffer_t *MsgBuf);
 /* Publishes the impulse request as RCS_ACT_REQ_MID, tagged with the

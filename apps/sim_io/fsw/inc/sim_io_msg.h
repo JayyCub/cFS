@@ -3,20 +3,22 @@
 
 /*
 ** Software Bus messages that cross the SIM_IO boundary. Other apps include this
-** header to consume SIM_STATE or publish WRENCH_CMD; none of them touch sockets.
+** header to consume SIM_STATE or publish THRUSTER_CMD; none of them touch sockets.
 */
 
 #include "cfe.h"
 #include "simlink_icd.h"
 
 /*
-** SIM_STATE — published once per received Unity frame. Its arrival is what
-** schedules the GNC cycle (lock-step): there is no wall-clock GNC wakeup.
+** SIM_STATE — raw sensor readings, published once per received Unity frame.
+** Its arrival schedules the NAV cycle, and NAV's solution schedules GNC
+** (lock-step): there is no wall-clock GNC wakeup. GNC also reads the hand
+** controllers and mechanism switches from it directly.
 */
 typedef struct
 {
     CFE_MSG_TelemetryHeader_t TelemetryHeader;
-    uint32                    Seq;       /* Unity cycle counter; echo it in WRENCH_CMD */
+    uint32                    Seq;       /* Unity cycle counter; THRUSTER_CMD echoes it */
     uint32                    Spare;
     double                    SimTime_s; /* simulation time at this cycle boundary      */
     SIMLINK_SimState_t        State;
@@ -59,7 +61,7 @@ typedef struct
     uint32                    RxBadCrc;
     uint32                    RxSeqGaps;      /* frames that skipped one or more Seq values   */
     uint32                    RxSeqRestarts;  /* Seq went backwards (Unity scenario restart)  */
-    uint32                    TxCount;        /* WRENCH_CMD frames sent to Unity              */
+    uint32                    TxCount;        /* THRUSTER_CMD frames sent to Unity            */
     uint32                    TxErrors;
     uint32                    TxStaleSeq;     /* commands answering an older SIM_STATE        */
     uint32                    LastRxSeq;

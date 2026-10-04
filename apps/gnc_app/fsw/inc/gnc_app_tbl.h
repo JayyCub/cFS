@@ -252,6 +252,19 @@ typedef struct
     float ManualRate_rads;         /* rad/s at full RHC deflection           */
     float ManualRateDeadband_rads; /* rad/s — rate-hold deadband             */
 
+    /*
+    ** Lateral channel velocity source (realism phase 4).
+    **   1 = docking-port point velocity, v_cm + ω×r_port, in the docking frame —
+    **       the true time derivative of the port lateral offset the channel
+    **       steers on. Rotation that swings the port sideways now shows up as
+    **       lateral velocity (at 3.9 m from the CoM, 0.003 rad/s is 1.2 cm/s).
+    **   0 = centre-of-mass velocity (LVLH X/Y) — the pre-phase-4 behaviour,
+    **       which mixed a port position with a CoM velocity.
+    ** A flight-test lever: if 1 couples badly with the attitude loop, 0 puts
+    ** the old behaviour back without a code change.
+    */
+    uint32 LatVelAtPort;
+
 } GNC_ParamTbl_t;
 
 #endif /* GNC_APP_TBL_H */

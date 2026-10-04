@@ -190,6 +190,10 @@ GNC_ParamTbl_t GNC_ParamTbl =
     .ManualAccel_mss         = 0.02f,
     .ManualRate_rads         = 0.0175f,
     .ManualRateDeadband_rads = 0.0008f,
+
+    /* Lateral channel steers on the docking-port point velocity (NAV), the
+       derivative of the port offset it controls. 0 = old CoM velocity. */
+    .LatVelAtPort = 1,
 };
 
 /*

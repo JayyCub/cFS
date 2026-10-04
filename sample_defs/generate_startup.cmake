@@ -11,6 +11,7 @@ function (generate_cfs_startup_script CFS_INSTALL_DIR)
         "CFE_APP, sample_app,  SAMPLE_APP_Main,    SAMPLE_APP,   50,   32768, 0x0, 0;\n"
         "CFE_APP, sim_io,      SIM_IO_Main,        SIM_IO,       54,   32768, 0x0, 0;\n"
         "CFE_APP, rcs,         RCS_Main,           RCS,          54,   32768, 0x0, 0;\n"
+        "CFE_APP, nav,         NAV_Main,           NAV,          55,   32768, 0x0, 0;\n"
         "CFE_APP, gnc_app,     GNC_APP_Main,       GNC_APP,      55,   32768, 0x0, 0;\n"
     )
 

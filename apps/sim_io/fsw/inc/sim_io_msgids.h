@@ -9,6 +9,7 @@
 **   0x96-0x98  sim_io   (0x98 = THRUSTER_CMD, published by the rcs app and
 **                        consumed here — the "valve driver interface")
 **   0x99,0xA2  rcs      (see rcs_msgids.h)
+**   0xD0-0xD1  nav      (see nav_msgids.h)
 */
 
 /* Commands / scheduling received by sim_io */
@@ -17,7 +18,7 @@
 
 /* Messages published by sim_io */
 #define SIM_IO_HK_TLM_MID    0x0896 /* housekeeping                                     */
-#define SIM_IO_SIM_STATE_MID 0x0897 /* one per Unity GNC cycle — also the GNC wakeup    */
+#define SIM_IO_SIM_STATE_MID 0x0897 /* one per Unity GNC cycle — also the NAV wakeup    */
 
 /* Published by the rcs app, consumed by sim_io (forwarded to Unity) and by
 ** gnc_app (actuator-health check against the impulse actually commanded) */

@@ -22,6 +22,7 @@
 #include "gnc_app_msgids.h"
 #include "sim_io_msgids.h"
 #include "rcs_msgids.h"
+#include "nav_msgids.h"
 
 #define FDR_EVS 0 /* ds_file_tbl.c index: event log     */
 #define FDR_GNC 1 /* ds_file_tbl.c index: GNC flight data */
@@ -43,11 +44,13 @@ DS_FilterTable_t DS_FilterTable = {
             /* per lock-step cycle */
             {.MessageID = CFE_SB_MSGID_WRAP_VALUE(GNC_APP_STATE_TLM_MID), .Filter = FDR_ALL(FDR_GNC)},
             {.MessageID = CFE_SB_MSGID_WRAP_VALUE(SIM_IO_THRUSTER_CMD_MID), .Filter = FDR_ALL(FDR_GNC)},
+            {.MessageID = CFE_SB_MSGID_WRAP_VALUE(NAV_SOLUTION_MID), .Filter = FDR_ALL(FDR_GNC)},
 
             /* housekeeping, 1 Hz */
             {.MessageID = CFE_SB_MSGID_WRAP_VALUE(GNC_APP_HK_TLM_MID), .Filter = FDR_ALL(FDR_GNC)},
             {.MessageID = CFE_SB_MSGID_WRAP_VALUE(RCS_HK_TLM_MID), .Filter = FDR_ALL(FDR_GNC)},
             {.MessageID = CFE_SB_MSGID_WRAP_VALUE(SIM_IO_HK_TLM_MID), .Filter = FDR_ALL(FDR_GNC)},
+            {.MessageID = CFE_SB_MSGID_WRAP_VALUE(NAV_HK_TLM_MID), .Filter = FDR_ALL(FDR_GNC)},
             {.MessageID = CFE_SB_MSGID_WRAP_VALUE(LC_HK_TLM_MID), .Filter = FDR_ALL(FDR_GNC)},
             {.MessageID = CFE_SB_MSGID_WRAP_VALUE(SC_HK_TLM_MID), .Filter = FDR_ALL(FDR_GNC)},
         },

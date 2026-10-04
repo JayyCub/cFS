@@ -7,13 +7,13 @@
 ** In a flight system this is the layer that talks to hardware (1553/SpaceWire/
 ** UART device drivers). Here the "hardware" is Unity over UDP. It is the only
 ** app that owns sockets: everything downstream sees plain Software Bus
-** messages, so GNC (and later NAV/RCS) are identical whether the vehicle is a
+** messages, so NAV, GNC and RCS are identical whether the vehicle is a
 ** simulation or real avionics.
 **
 ** Task layout:
 **   main task  — SB pipe: THRUSTER_CMD from RCS (-> UDP to Unity), SEND_HK, ground cmds
 **   rx child   — blocks on the UDP socket, validates SimLink frames, publishes
-**                SIM_STATE to the SB (which in turn schedules GNC — lock-step)
+**                SIM_STATE to the SB (which in turn schedules NAV -> GNC — lock-step)
 */
 
 #include "cfe.h"

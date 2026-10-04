@@ -220,7 +220,7 @@ void SIM_IO_SendThrusterCmd(const SIM_IO_ThrusterCmdMsg_t *Msg)
     OS_MutSemGive(SIM_IO_Data.LastRxMutex);
 
     /* Still forwarded — Unity discards it if it has moved on — but counted,
-    ** because in lock-step a stale answer means FSW (GNC -> RCS) fell behind. */
+    ** because in lock-step a stale answer means FSW (NAV -> GNC -> RCS) fell behind. */
     if (Msg->Seq != LastSeq)
         SIM_IO_Data.HkTlm.TxStaleSeq++;
 
