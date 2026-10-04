@@ -122,7 +122,7 @@
 ** SCH_LAB instead. Indices must match sample_defs/cpu1/tables/lc_def_adt.c.
 */
 #define GNC_APP_LC_CYCLE_AP_FIRST 1
-#define GNC_APP_LC_CYCLE_AP_LAST  1
+#define GNC_APP_LC_CYCLE_AP_LAST  3
 
 /* Seconds of silence after which a returning SIM_STATE is worth an event */
 #define GNC_LINK_RESTORED_EVT_SEC 2

@@ -47,6 +47,8 @@
 #define NAV_RPS_INF_EID       13 /* LIDAR acquired / lost the target                */
 #define NAV_SENSOR_ERR_EID    14 /* malformed sensor reading discarded              */
 #define NAV_BAD_DT_EID        15 /* SIM_STATE CycleDt_s out of range                */
+#define NAV_ATT_FILTER_INF_EID 16 /* attitude filter initialised                    */
+#define NAV_ATT_FILTER_ERR_EID 17 /* attitude filter divergence recovery / reset    */
 
 #define NAV_TBL_VALIDATE_ERR (0xc0000013)
 

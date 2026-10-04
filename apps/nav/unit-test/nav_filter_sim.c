@@ -34,6 +34,10 @@ static const double RNG_SIGMA0  = 0.005;  /* m               */
 static const double RNG_FRAC    = 0.001;
 static const double ANG_SIGMA   = 5e-4;   /* rad             */
 static const double RPS_MIN_RNG = 0.3, RPS_MAX_RNG = 250.0, RPS_HALF_FOV = 35.0 * 3.14159265358979 / 180.0;
+static const double POSE_SIGMA  = 3e-3;   /* rad             */
+static const double POSE_MAX_RNG = 30.0;  /* m               */
+static const double GYRO_BIAS[3]  = {1.5e-6, -1.0e-6, 2.0e-6}; /* rad/s */
+static const double ACCEL_BIAS[3] = {2.0e-5, -1.5e-5, 3.0e-5}; /* m/s²  */
 
 static unsigned long long Rng = 12345;
 static double Uniform(void)
@@ -120,7 +124,7 @@ static void TruthPort(const Truth_t *T, double pos_D[3], double vel_D[3], double
 }
 
 /* Sensors at a cycle boundary (dv_B accumulated over the cycle by the caller) */
-static void Sense(const Truth_t *T, const double dv_B[3], bool rps_enabled, SIMLINK_SimState_t *s)
+static void Sense(const Truth_t *T, const double dv_B[3], bool rps_enabled, bool st_enabled, SIMLINK_SimState_t *s)
 {
     double pB[3] = {NAV_CfgTbl.RpsPos_B[0], NAV_CfgTbl.RpsPos_B[1], NAV_CfgTbl.RpsPos_B[2]};
     double tT[3] = {NAV_CfgTbl.TargetPortPos_T[0], NAV_CfgTbl.TargetPortPos_T[1], NAV_CfgTbl.TargetPortPos_T[2]};
@@ -130,11 +134,11 @@ static void Sense(const Truth_t *T, const double dv_B[3], bool rps_enabled, SIML
 
     memset(s, 0, sizeof(*s));
     s->CycleDt_s   = (float)(PHYS_DT * STEPS);
-    s->SensorValid = SIMLINK_SENSOR_IMU | SIMLINK_SENSOR_ST;
+    s->SensorValid = SIMLINK_SENSOR_IMU | (st_enabled ? SIMLINK_SENSOR_ST : 0u);
     for (i = 0; i < 3; i++)
     {
-        s->GyroRate_B[i] = (float)(T->w[i] + GYRO_SIGMA * Gauss());
-        s->DeltaV_B[i]   = (float)(dv_B[i] + DV_SIGMA * Gauss());
+        s->GyroRate_B[i] = (float)(T->w[i] + GYRO_BIAS[i] + GYRO_SIGMA * Gauss());
+        s->DeltaV_B[i]   = (float)(dv_B[i] + ACCEL_BIAS[i] * PHYS_DT * STEPS + DV_SIGMA * Gauss());
     }
     memcpy(s->StQuat, T->q, sizeof(s->StQuat));
     SmallRot(s->StQuat, ST_SIGMA * Gauss(), ST_SIGMA * Gauss(), ST_SIGMA * Gauss());
@@ -155,6 +159,15 @@ static void Sense(const Truth_t *T, const double dv_B[3], bool rps_enabled, SIML
             s->RpsRange_m = (float)(rng + (RNG_SIGMA0 + RNG_FRAC * rng) * Gauss());
             s->RpsAz_rad  = (float)(atan2(p_S[0], p_S[2]) + ANG_SIGMA * Gauss());
             s->RpsEl_rad  = (float)(asin(p_S[1] / rng) + ANG_SIGMA * Gauss());
+            if (rng <= POSE_MAX_RNG)
+            {
+                /* pose: q_S_TP = conj(q_L_S) ⊗ q_L_TP, with orientation noise */
+                float q_L_TP[4];
+                NAV_QuatMul(NAV_CfgTbl.TargetAttQuat_L, NAV_CfgTbl.TargetPortQuat_T, q_L_TP);
+                NAV_QuatMul(q_S_L, q_L_TP, s->RpsQuat);
+                SmallRot(s->RpsQuat, POSE_SIGMA * Gauss(), POSE_SIGMA * Gauss(), POSE_SIGMA * Gauss());
+                s->SensorValid |= SIMLINK_SENSOR_RPS_POSE;
+            }
         }
     }
 }
@@ -201,6 +214,7 @@ typedef struct
     int         dropout_from, dropout_to; /* LIDAR blanked over [from, to) */
     int         jump_at;     /* teleport (scenario reset) at this cycle, -1 = none */
     double      lim_pos, lim_vel, lim_att; /* RMS limits after convergence */
+    int         st_from, st_to; /* star tracker blanked over [from, to) */
 } Scenario_t;
 
 static int Run(const Scenario_t *sc)
@@ -210,7 +224,7 @@ static int Run(const Scenario_t *sc)
     NAV_Output_t       O;
     SIMLINK_SimState_t s;
     double             dv_B[3] = {0, 0, 0};
-    double se_p[3] = {0}, se_v[3] = {0}, se_a = 0, max_vlat = 0;
+    double se_p[3] = {0}, se_v[3] = {0}, se_a = 0, max_vlat = 0, max_att_outage = 0;
     long               nstat = 0, n3sig = 0, nvalid_first = -1, inits = 0, reinits = 0, rejects = 0;
     int                c, i;
 
@@ -232,9 +246,13 @@ static int Run(const Scenario_t *sc)
             T.v[0] = T.v[1] = T.v[2] = 0;
         }
 
-        Sense(&T, dv_B, !(c >= sc->dropout_from && c < sc->dropout_to), &s);
+        Sense(&T, dv_B, !(c >= sc->dropout_from && c < sc->dropout_to), !(c >= sc->st_from && c < sc->st_to), &s);
         NAV_Step(&S, &NAV_CfgTbl, &s, &O);
         TruthPort(&T, pos_D, vel_D, atterr);
+        if (c >= sc->st_from && c < sc->st_to)
+            for (i = 0; i < 3; i++)
+                if (fabs(O.AttErr_B[i] - atterr[i]) > max_att_outage)
+                    max_att_outage = fabs(O.AttErr_B[i] - atterr[i]);
 
         if (O.Events & NAV_EVT_FILTER_INIT)
             inits++;
@@ -304,13 +322,29 @@ static int Run(const Scenario_t *sc)
         double rv = sqrt((se_v[0] + se_v[1]) / (2.0 * (nstat ? nstat : 1)));
         double rz = sqrt(se_v[2] / (nstat ? nstat : 1));
         double ra = sqrt(se_a / (3.0 * (nstat ? nstat : 1)));
+        double eg = 0, ea2 = 0;
         int    ok = nstat > 0 && rp <= sc->lim_pos && rv <= sc->lim_vel && ra <= sc->lim_att;
+        for (i = 0; i < 3; i++)
+        {
+            if (fabs(O.GyroBias_rads[i] - GYRO_BIAS[i]) > eg)
+                eg = fabs(O.GyroBias_rads[i] - GYRO_BIAS[i]);
+            if (fabs(O.AccelBias_mss[i] - ACCEL_BIAS[i]) > ea2)
+                ea2 = fabs(O.AccelBias_mss[i] - ACCEL_BIAS[i]);
+        }
         if (sc->jump_at >= 0 && reinits < 1)
             ok = 0;
+        if (eg > 7.5e-7 || ea2 > 1.5e-5) /* bias estimates: within half the injected bias */
+            ok = 0;
+        if (sc->st_from >= 0 && max_att_outage > 1e-3)
+            ok = 0;
         printf("%-28s valid@%4ld  inits %ld reinits %ld rejects %3ld | RMS pos %.4f m  lat-vel %.5f m/s (max %.5f)"
-               "  ax-vel %.5f  att %.5f rad | in 3sig %.1f%%  final sigma %.4f/%.5f  %s\n",
+               "  ax-vel %.5f  att %.5f rad | in 3sig %.1f%%  final sigma %.4f/%.5f\n"
+               "%-28s bias error gyro %.1e rad/s accel %.1e m/s2 | att sigma %.1e rad",
                sc->name, nvalid_first, inits, reinits, rejects, rp, rv, max_vlat, rz, ra,
-               100.0 * n3sig / (nstat ? nstat : 1), O.PosSigma_m, O.VelSigma_ms, ok ? "PASS" : "FAIL");
+               100.0 * n3sig / (nstat ? nstat : 1), O.PosSigma_m, O.VelSigma_ms, "", eg, ea2, O.AttSigma_rad);
+        if (sc->st_from >= 0)
+            printf(" | max att error in ST outage %.1e rad", max_att_outage);
+        printf("  %s\n", ok ? "PASS" : "FAIL");
         return ok ? 0 : 1;
     }
 }
@@ -321,10 +355,11 @@ int main(void)
     int         fails = 0;
     static const Scenario_t sc[] = {
         /* name                        r0 (CoM rel ISS)        v0              w0 (rad/s)          att0 (rad)        cyc  close  dropout   jump  lim pos/vel/att */
-        {"approach from 40 m",          {0.5, -6.0, -60.0}, {0, 0, 0},      {0, 0, 0},          {0.02, -0.01, 0.01}, 3000, 0.10, -1, -1,  -1, 0.03, 0.0005, 0.0002},
-        {"close in from 6 m, rotating", {0.05, -5.6, -24.0}, {0, 0, 0.02},  {0.001, -0.0005, 0.002}, {0, 0, 0},     700,  0.05, -1, -1,  -1, 0.01, 0.0005, 0.0002},
-        {"LIDAR dropout 20 s",          {0.2, -5.8, -40.0}, {0, 0, 0},      {0, 0, 0},          {0, 0, 0},       2000, 0.08, 600, 700, -1, 0.03, 0.0005, 0.0002},
-        {"scenario reset (teleport)",   {0.2, -5.8, -40.0}, {0, 0, 0},      {0, 0, 0},          {0, 0, 0},       1500, 0.08, -1, -1, 400, 0.03, 0.0005, 0.0002},
+        {"approach from 40 m",          {0.5, -6.0, -60.0}, {0, 0, 0},      {0, 0, 0},          {0.02, -0.01, 0.01}, 3000, 0.10, -1, -1,  -1, 0.03, 0.0005, 0.0002, -1, -1},
+        {"close in from 6 m, rotating", {0.05, -5.6, -24.0}, {0, 0, 0.02},  {0.001, -0.0005, 0.002}, {0, 0, 0},     700,  0.05, -1, -1,  -1, 0.01, 0.0005, 0.0002, -1, -1},
+        {"LIDAR dropout 20 s",          {0.2, -5.8, -40.0}, {0, 0, 0},      {0, 0, 0},          {0, 0, 0},       2000, 0.08, 600, 700, -1, 0.03, 0.0005, 0.0002, -1, -1},
+        {"scenario reset (teleport)",   {0.2, -5.8, -40.0}, {0, 0, 0},      {0, 0, 0},          {0, 0, 0},       1500, 0.08, -1, -1, 400, 0.03, 0.0005, 0.0002, -1, -1},
+        {"star tracker out 60 s",       {0.2, -5.8, -60.0}, {0, 0, 0},      {0, 0, 0},          {0.01, 0, 0},    2500, 0.08, -1, -1,  -1, 0.03, 0.0005, 0.0003, 1200, 1500},
     };
     unsigned i;
 

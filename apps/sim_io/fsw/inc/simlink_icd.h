@@ -25,12 +25,16 @@
 ** v4 (realism phase 4): SIM_STATE carries raw sensor readings (IMU, star
 ** tracker, relative-pose LIDAR, docking-mechanism switches) instead of
 ** truth-derived navigation. The cFS NAV app does the navigation.
+**
+** v5 (realism phase 4b): the LIDAR also reports its pose solution — the
+** target port's orientation relative to the sensor (RpsQuat), inside its
+** pose range.
 */
 
 #include "common_types.h"
 
 #define SIMLINK_SYNC_WORD 0x324B4C53u /* bytes 'S','L','K','2' on the wire (LE) */
-#define SIMLINK_VERSION   4u
+#define SIMLINK_VERSION   5u
 
 #define SIMLINK_TYPE_SIM_STATE    1u /* Unity -> cFS, once per GNC cycle            */
 #define SIMLINK_TYPE_THRUSTER_CMD 3u /* cFS -> Unity, echoes the SIM_STATE Seq      */
@@ -59,7 +63,8 @@ typedef struct
 /* SensorValid bits in SIMLINK_SimState_t: the device produced a reading this cycle */
 #define SIMLINK_SENSOR_IMU 0x1u /* GyroRate_B and DeltaV_B                                */
 #define SIMLINK_SENSOR_ST  0x2u /* StQuat                                                 */
-#define SIMLINK_SENSOR_RPS 0x4u /* RpsRange/Az/El — target in field of view and in range */
+#define SIMLINK_SENSOR_RPS      0x4u /* RpsRange/Az/El — target in field of view and in range */
+#define SIMLINK_SENSOR_RPS_POSE 0x8u /* RpsQuat — close enough for a pose solution             */
 
 /* MechFlags bits in SIMLINK_SimState_t: docking-mechanism switches */
 #define SIMLINK_MECH_CAPTURE 0x1u /* soft-capture latches engaged */
@@ -96,6 +101,7 @@ typedef struct
     float RpsRange_m;
     float RpsAz_rad;
     float RpsEl_rad;
+    float RpsQuat[4]; /* q_S_TP: target port axes in the sensor frame (x, y, z, w)           */
 
     uint32 MechFlags; /* SIMLINK_MECH_*                                                    */
 
@@ -122,7 +128,7 @@ typedef struct
 
 _Static_assert(sizeof(SIMLINK_Header_t) == 24, "SimLink header layout changed");
 _Static_assert(sizeof(SIMLINK_Trailer_t) == 4, "SimLink trailer layout changed");
-_Static_assert(sizeof(SIMLINK_SimState_t) == 88, "SimLink SIM_STATE layout changed");
+_Static_assert(sizeof(SIMLINK_SimState_t) == 104, "SimLink SIM_STATE layout changed");
 _Static_assert(sizeof(SIMLINK_ThrusterCmd_t) == 72, "SimLink THRUSTER_CMD layout changed");
 
 /* CRC-16/CCITT-FALSE: poly 0x1021, init 0xFFFF, no reflection, no final XOR. */

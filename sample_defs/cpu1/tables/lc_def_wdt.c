@@ -26,6 +26,8 @@
 #include "lc_tbl.h"
 #include "gnc_app_msgids.h"
 #include "gnc_app_msg.h"
+#include "nav_msgids.h"
+#include "nav_msg.h"
 
 CFE_TBL_FileDef_t CFE_TBL_FileDef = { "LC_WDT",
                                       LC_APP_NAME "." LC_WDT_TABLENAME,
@@ -106,9 +108,31 @@ LC_WDTEntry_t LC_WDT[LC_MAX_WATCHPOINTS] = {
         .ComparisonValue.Unsigned8  = GNC_APP_PHASE_APPROACH,
     },
 
-    /* #5 .. #175: unused */
-    LC_WDT_UNUSED,
-    LC_WDT_UNUSED,
+    /* #5: GNC STATE: NAV relative solution unusable (translation coasting) */
+    {
+        .DataType                   = LC_DATA_WATCH_UBYTE,
+        .OperatorID                 = LC_OPER_EQ,
+        .MessageID                  = CFE_SB_MSGID_WRAP_VALUE(GNC_APP_STATE_TLM_MID),
+        .WatchpointOffset           = offsetof(GNC_APP_StateTlm_t, Flags),
+        .BitMask                    = GNC_APP_FLAG_NAV_INVALID,
+        .CustomFuncArgument         = 0,
+        .ResultAgeWhenStale         = 0,
+        .ComparisonValue.Unsigned8  = GNC_APP_FLAG_NAV_INVALID,
+    },
+
+    /* #6: NAV SOLUTION: >= 5 LIDAR fixes rejected in a row */
+    {
+        .DataType                   = LC_DATA_WATCH_UWORD_LE,
+        .OperatorID                 = LC_OPER_GE,
+        .MessageID                  = CFE_SB_MSGID_WRAP_VALUE(NAV_SOLUTION_MID),
+        .WatchpointOffset           = offsetof(NAV_SolutionMsg_t, ConsecRpsRejects),
+        .BitMask                    = LC_BITMASK_NONE,
+        .CustomFuncArgument         = 0,
+        .ResultAgeWhenStale         = 0,
+        .ComparisonValue.Unsigned16 = 5,
+    },
+
+    /* #7 .. #175: unused */
     LC_WDT_UNUSED,
     LC_WDT_UNUSED,
     LC_WDT_UNUSED,

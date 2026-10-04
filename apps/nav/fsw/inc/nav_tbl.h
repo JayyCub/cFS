@@ -47,7 +47,8 @@ typedef struct
     float RpsRangeSigma_m;   /* LIDAR range noise floor (m)                              */
     float RpsRangeSigmaFrac; /* plus this fraction of range                              */
     float RpsAngleSigma_rad; /* LIDAR azimuth / elevation noise (rad)                    */
-    float AttSigma_rad;      /* star tracker attitude noise; it rotates the LIDAR fix   */
+    float AttSigma_rad;      /* star tracker attitude noise, per axis (rad)             */
+    float RpsPoseSigma_rad;  /* LIDAR pose solution orientation noise, per axis (rad)    */
 
     /* Filter tuning */
     float  AccelNoise_mss;   /* unmodelled acceleration (process noise), 1-sigma (m/s²)  */
@@ -59,6 +60,14 @@ typedef struct
                              ** rejected fixes (divergence recovery)                     */
     float  MaxPosSigma_m;    /* relative nav VALID only while position sigma <= this     */
     float  MaxVelSigma_ms;   /*   ... and velocity sigma <= this                         */
+
+    /* Sensor errors the filters estimate (realism phase 4b) */
+    float AccelBiasWalk_mss;      /* accelerometer bias random walk (m/s² per sqrt s)     */
+    float InitAccelBiasSigma_mss; /* accelerometer bias uncertainty at initialisation     */
+    float GyroNoise_rads;         /* gyro rate noise per sample, 1-sigma (rad/s)          */
+    float GyroBiasWalk_rads;      /* gyro bias random walk (rad/s per sqrt s)             */
+    float InitGyroBiasSigma_rads; /* gyro bias uncertainty at initialisation              */
+    float MaxAttSigma_rad;        /* attitude VALID only while its sigma <= this          */
 } NAV_CfgTbl_t;
 
 #endif /* NAV_TBL_H */

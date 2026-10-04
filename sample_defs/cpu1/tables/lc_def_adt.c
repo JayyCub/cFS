@@ -11,16 +11,24 @@
 ** Actionpoints are only evaluated when LC is asked to sample them, in two rate
 ** groups:
 **   AP 0      SCH_LAB, 1 Hz wall clock — must evaluate while the sim is silent.
-**   AP 1..1   gnc_app, end of every lock-step cycle (GNC_APP_LC_CYCLE_AP_*) —
+**   AP 1..3   gnc_app, end of every lock-step cycle (GNC_APP_LC_CYCLE_AP_*) —
 **             persistence counts sim cycles, not wall seconds.
 **
 **   AP  Fails when                                          Response
 **   0   link silent >= 2 s AND NOT docked AND NOT aborted  RTS 2: GNC ABORT
 **   1   axial under-delivery >= 3 cycles AND APPROACH      RTS 3: GNC HOLD
+**   2   NAV relative solution unusable AND APPROACH,       RTS 2: GNC ABORT
+**       10 cycles (2 s) in a row
+**   3   >= 5 LIDAR fixes rejected in a row AND APPROACH    RTS 3: GNC HOLD
 **
 ** HOLD, not ABORT, for the actuator anomaly: the monitor can false-alarm
 ** (contact forces, CW drift on tiny burns), and HOLD stops the closure while
 ** still flying — the ground decides with GO or ABORT.
+**
+** ABORT for a lost navigation solution on approach: closing on the port blind
+** is the one thing that must not continue, and the abort manoeuvre needs no
+** relative navigation. HOLD for rejected LIDAR fixes: NAV is still coasting
+** on a good solution, but something disagrees — stop closing and look.
 */
 
 #include "cfe_tbl_filedef.h"
@@ -85,9 +93,37 @@ LC_ADTEntry_t LC_ADT[LC_MAX_ACTIONPOINTS] = {
         .RPNEquation       = {3, 4, LC_RPN_AND, LC_RPN_EQUAL},
     },
 
-    /* #2 .. #175: unused */
-    LC_ADT_UNUSED,
-    LC_ADT_UNUSED,
+    /* #2: NAV relative solution lost on approach -> RTS 2 (GNC ABORT). Rate group: GNC cycle. */
+    {
+        .DefaultState      = LC_APSTATE_ACTIVE,
+        .MaxPassiveEvents  = 2,
+        .MaxPassFailEvents = 2,
+        .MaxFailPassEvents = 2,
+        .RTSId             = DOCK_RTS_LINK_LOSS_ABORT,
+        .MaxFailsBeforeRTS = 10,
+        .EventType         = CFE_EVS_EventType_CRITICAL,
+        .EventID           = LC_BASE_AP_EID + 2,
+        .EventText         = {"NAV lost on approach: ABORT"},
+        /* NAV invalid AND APPROACH */
+        .RPNEquation       = {5, 4, LC_RPN_AND, LC_RPN_EQUAL},
+    },
+
+    /* #3: LIDAR fixes rejected on approach -> RTS 3 (GNC HOLD). Rate group: GNC cycle. */
+    {
+        .DefaultState      = LC_APSTATE_ACTIVE,
+        .MaxPassiveEvents  = 2,
+        .MaxPassFailEvents = 2,
+        .MaxFailPassEvents = 2,
+        .RTSId             = DOCK_RTS_ACTUATOR_HOLD,
+        .MaxFailsBeforeRTS = 1,
+        .EventType         = CFE_EVS_EventType_ERROR,
+        .EventID           = LC_BASE_AP_EID + 3,
+        .EventText         = {"LIDAR fixes rejected: HOLD"},
+        /* rejects AND APPROACH */
+        .RPNEquation       = {6, 4, LC_RPN_AND, LC_RPN_EQUAL},
+    },
+
+    /* #4 .. #175: unused */
     LC_ADT_UNUSED,
     LC_ADT_UNUSED,
     LC_ADT_UNUSED,

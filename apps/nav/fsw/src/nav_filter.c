@@ -7,7 +7,10 @@
 ** rigid-body point velocity is v + ω × r with the standard cross-product
 ** formula. The same algebra is used here throughout.
 **
-** The filter runs in double precision: position variances span ~1e-6 m²
+** Attitude error convention (MEKF): the true attitude is q̂ ⊗ δq(δθ), δθ a small
+** rotation in body axes. With the bias-corrected rate ω, δθ' = -ω×δθ - δb.
+**
+** The filters run in double precision: position variances span ~1e-6 m²
 ** (LIDAR at close range) to ~1e2 m² (after a long LIDAR outage).
 */
 #include <math.h>
@@ -115,8 +118,27 @@ static void QuatToRotVec(const float q[4], float rv[3])
     rv[2] = k * q[2];
 }
 
-/* Columns of the rotation matrix of q, in double for the covariance math */
-static void QuatToDcm(const float q[4], double m[3][3])
+/* q ← q ⊗ δq(θ), θ a rotation vector in the frame q rotates from (body) */
+static void QuatApplyRotVec(float q[4], double tx, double ty, double tz)
+{
+    double th = sqrt(tx * tx + ty * ty + tz * tz);
+    float  dq[4];
+
+    if (th < 1e-12)
+        return;
+    {
+        double s = sin(0.5 * th) / th;
+        dq[0]    = (float)(tx * s);
+        dq[1]    = (float)(ty * s);
+        dq[2]    = (float)(tz * s);
+        dq[3]    = (float)cos(0.5 * th);
+    }
+    NAV_QuatMul(q, dq, q);
+    (void)NAV_QuatNormalize(q, 0.5f);
+}
+
+/* Rotation matrix of q (columns = rotated basis vectors), row-major 3×3 */
+static void QuatToDcm(const float q[4], double m[9])
 {
     static const float E[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
     float              c[3];
@@ -126,8 +148,136 @@ static void QuatToDcm(const float q[4], double m[3][3])
     {
         NAV_QuatRotate(q, E[j], c);
         for (i = 0; i < 3; i++)
-            m[i][j] = c[i];
+            m[i * 3 + j] = c[i];
     }
+}
+
+/* ======================================================================= */
+/* Matrix helpers — row-major flat arrays, n <= NAV_NX                      */
+/* ======================================================================= */
+
+/* C(n×m) = A(n×k) · B(k×m); C must not alias A or B */
+static void MatMul(const double *A, const double *B, double *C, int n, int k, int m)
+{
+    int i, j, l;
+    for (i = 0; i < n; i++)
+        for (j = 0; j < m; j++)
+        {
+            double s = 0.0;
+            for (l = 0; l < k; l++)
+                s += A[i * k + l] * B[l * m + j];
+            C[i * m + j] = s;
+        }
+}
+
+/* C(n×m) = A(n×k) · B(m×k)ᵀ; C must not alias A or B */
+static void MatMulT(const double *A, const double *B, double *C, int n, int k, int m)
+{
+    int i, j, l;
+    for (i = 0; i < n; i++)
+        for (j = 0; j < m; j++)
+        {
+            double s = 0.0;
+            for (l = 0; l < k; l++)
+                s += A[i * k + l] * B[j * k + l];
+            C[i * m + j] = s;
+        }
+}
+
+/* P ← Φ P Φᵀ (n×n) */
+static void CovPropagate(double *P, const double *Phi, int n)
+{
+    double T[NAV_NX * NAV_NX];
+    MatMul(Phi, P, T, n, n, n);
+    MatMulT(T, Phi, P, n, n, n);
+}
+
+static bool Inverse3(const double *m, double *inv)
+{
+    double det = m[0] * (m[4] * m[8] - m[5] * m[7]) - m[1] * (m[3] * m[8] - m[5] * m[6]) +
+                 m[2] * (m[3] * m[7] - m[4] * m[6]);
+
+    if (!(fabs(det) > 1e-300) || !isfinite(det))
+        return false;
+
+    inv[0] = (m[4] * m[8] - m[5] * m[7]) / det;
+    inv[1] = (m[2] * m[7] - m[1] * m[8]) / det;
+    inv[2] = (m[1] * m[5] - m[2] * m[4]) / det;
+    inv[3] = (m[5] * m[6] - m[3] * m[8]) / det;
+    inv[4] = (m[0] * m[8] - m[2] * m[6]) / det;
+    inv[5] = (m[2] * m[3] - m[0] * m[5]) / det;
+    inv[6] = (m[3] * m[7] - m[4] * m[6]) / det;
+    inv[7] = (m[1] * m[6] - m[0] * m[7]) / det;
+    inv[8] = (m[0] * m[4] - m[1] * m[3]) / det;
+    return true;
+}
+
+/*
+** Kalman update for a 3-vector measurement of the first three states
+** (H = [I 0]), Joseph form. x is the state (translation) or the error state
+** (attitude) the correction K·y is added to. Returns false and leaves x, P
+** untouched if the innovation fails the chi-square gate.
+*/
+static bool KalmanUpdate3(int n, double *x, double *P, const double y[3], const double Rm[9], double gate,
+                          double *mahal)
+{
+    double S[9], Si[9], K[NAV_NX * 3], IKH[NAV_NX * NAV_NX], T[NAV_NX * NAV_NX], Pn[NAV_NX * NAV_NX];
+    double KR[NAV_NX * 3], d2 = 0.0;
+    int    i, j;
+
+    for (i = 0; i < 3; i++)
+        for (j = 0; j < 3; j++)
+            S[i * 3 + j] = P[i * n + j] + Rm[i * 3 + j];
+    if (!Inverse3(S, Si))
+    {
+        *mahal = INFINITY;
+        return false;
+    }
+    for (i = 0; i < 3; i++)
+        for (j = 0; j < 3; j++)
+            d2 += y[i] * Si[i * 3 + j] * y[j];
+    *mahal = sqrt(d2 > 0.0 ? d2 : 0.0);
+    if (!(*mahal <= gate))
+        return false;
+
+    /* K = P Hᵀ S⁻¹ = P[:, 0:3] S⁻¹ */
+    for (i = 0; i < n; i++)
+        for (j = 0; j < 3; j++)
+            K[i * 3 + j] = P[i * n + 0] * Si[0 * 3 + j] + P[i * n + 1] * Si[1 * 3 + j] + P[i * n + 2] * Si[2 * 3 + j];
+    for (i = 0; i < n; i++)
+        x[i] += K[i * 3 + 0] * y[0] + K[i * 3 + 1] * y[1] + K[i * 3 + 2] * y[2];
+
+    /* P = (I - KH) P (I - KH)ᵀ + K R Kᵀ */
+    for (i = 0; i < n; i++)
+        for (j = 0; j < n; j++)
+            IKH[i * n + j] = (i == j ? 1.0 : 0.0) - (j < 3 ? K[i * 3 + j] : 0.0);
+    MatMul(IKH, P, T, n, n, n);
+    MatMulT(T, IKH, Pn, n, n, n);
+    MatMul(K, Rm, KR, n, 3, 3);
+    MatMulT(KR, K, T, n, 3, n);
+    for (i = 0; i < n; i++)
+        for (j = 0; j < n; j++)
+            P[i * n + j] = 0.5 * ((Pn[i * n + j] + T[i * n + j]) + (Pn[j * n + i] + T[j * n + i]));
+    return true;
+}
+
+static bool AllFinite(const double *v, int n)
+{
+    int i;
+    for (i = 0; i < n; i++)
+        if (!isfinite(v[i]))
+            return false;
+    return true;
+}
+
+static double MaxDiagSigma(const double *P, int n, int first, int count)
+{
+    double m = 0.0;
+    int    i;
+    for (i = first; i < first + count; i++)
+        if (P[i * n + i] > m)
+            m = P[i * n + i];
+    return sqrt(m);
 }
 
 /* ======================================================================= */
@@ -153,19 +303,24 @@ const char *NAV_CheckConfig(const NAV_CfgTbl_t *Cfg)
     if (!(Cfg->MeanMotion_rads >= 0.0f && Cfg->MeanMotion_rads < 0.01f))
         return "MeanMotion_rads outside [0, 0.01)";
     if (!(Cfg->RpsRangeSigma_m > 0.0f) || !(Cfg->RpsRangeSigmaFrac >= 0.0f) || !(Cfg->RpsAngleSigma_rad > 0.0f) ||
-        !(Cfg->AttSigma_rad >= 0.0f))
+        !(Cfg->AttSigma_rad > 0.0f) || !(Cfg->RpsPoseSigma_rad > 0.0f))
         return "a measurement sigma is not positive";
-    if (!(Cfg->AccelNoise_mss >= 0.0f) || !(Cfg->DeltaVNoise_ms >= 0.0f) || !(Cfg->AccelNoise_mss > 0.0f || Cfg->DeltaVNoise_ms > 0.0f))
+    if (!(Cfg->AccelNoise_mss >= 0.0f) || !(Cfg->DeltaVNoise_ms >= 0.0f) ||
+        !(Cfg->AccelNoise_mss > 0.0f || Cfg->DeltaVNoise_ms > 0.0f) || !(Cfg->GyroNoise_rads > 0.0f) ||
+        !(Cfg->AccelBiasWalk_mss >= 0.0f) || !(Cfg->GyroBiasWalk_rads >= 0.0f))
         return "process noise must be positive";
-    if (!(Cfg->InitVelSigma_ms > 0.0f) || !(Cfg->GateSigma > 0.0f) || Cfg->MaxConsecRejects < 1)
-        return "InitVelSigma_ms, GateSigma or MaxConsecRejects not positive";
-    if (!(Cfg->MaxPosSigma_m > 0.0f) || !(Cfg->MaxVelSigma_ms > 0.0f))
-        return "MaxPosSigma_m / MaxVelSigma_ms not positive";
+    if (!(Cfg->InitVelSigma_ms > 0.0f) || !(Cfg->InitAccelBiasSigma_mss > 0.0f) ||
+        !(Cfg->InitGyroBiasSigma_rads > 0.0f))
+        return "an initial sigma is not positive";
+    if (!(Cfg->GateSigma > 0.0f) || Cfg->MaxConsecRejects < 1)
+        return "GateSigma or MaxConsecRejects not positive";
+    if (!(Cfg->MaxPosSigma_m > 0.0f) || !(Cfg->MaxVelSigma_ms > 0.0f) || !(Cfg->MaxAttSigma_rad > 0.0f))
+        return "a validity sigma limit is not positive";
     return NULL;
 }
 
 /* ======================================================================= */
-/* Translation filter                                                       */
+/* State resets                                                             */
 /* ======================================================================= */
 
 void NAV_ResetFilter(NAV_State_t *S)
@@ -178,6 +333,112 @@ void NAV_Reset(NAV_State_t *S)
     memset(S, 0, sizeof(*S));
 }
 
+/* ======================================================================= */
+/* Attitude filter (MEKF)                                                   */
+/* ======================================================================= */
+
+static void AttInit(NAV_AttFilter_t *A, const NAV_CfgTbl_t *Cfg, const float q[4], double sigma, bool keepBias)
+{
+    double b[3] = {0.0, 0.0, 0.0};
+    double sb   = Cfg->InitGyroBiasSigma_rads;
+    int    i;
+
+    if (keepBias && A->Initialized)
+        memcpy(b, A->Bias, sizeof(b));
+    memset(A->P, 0, sizeof(A->P));
+    memcpy(A->Q, q, sizeof(A->Q));
+    memcpy(A->Bias, b, sizeof(A->Bias));
+    for (i = 0; i < 3; i++)
+    {
+        A->P[i][i]         = sigma * sigma;
+        A->P[i + 3][i + 3] = sb * sb;
+    }
+    A->Initialized   = true;
+    A->ConsecRejects = 0;
+}
+
+/*
+** Propagate over dt with the bias-corrected gyro, trapezoidal between this
+** cycle's and the previous cycle's sample. Error-state transition (first order):
+**   Φ = [ I - [θ×]   -I·dt ]      θ = ω·dt
+**       [ 0           I    ]
+** Process noise: gyro noise on the angle, random walk on the bias. With no
+** gyro the attitude is held and its uncertainty grows at NAV_NO_GYRO_RATE_SIGMA.
+*/
+static void AttPropagate(NAV_AttFilter_t *A, const NAV_CfgTbl_t *Cfg, double dt, bool imu, const float gyro[3])
+{
+    double Phi[NAV_NA * NAV_NA];
+    double qa, qb = (double)Cfg->GyroBiasWalk_rads * Cfg->GyroBiasWalk_rads * dt;
+    int    i;
+
+    memset(Phi, 0, sizeof(Phi));
+    for (i = 0; i < NAV_NA; i++)
+        Phi[i * NAV_NA + i] = 1.0;
+
+    if (imu)
+    {
+        double w[3], th[3];
+        for (i = 0; i < 3; i++)
+        {
+            double g = A->HavePrevGyro ? 0.5 * ((double)A->PrevGyro[i] + gyro[i]) : gyro[i];
+            w[i]     = g - A->Bias[i];
+            th[i]    = w[i] * dt;
+        }
+        QuatApplyRotVec(A->Q, th[0], th[1], th[2]);
+
+        /* I - [θ×] */
+        Phi[0 * NAV_NA + 1] = th[2];
+        Phi[0 * NAV_NA + 2] = -th[1];
+        Phi[1 * NAV_NA + 0] = -th[2];
+        Phi[1 * NAV_NA + 2] = th[0];
+        Phi[2 * NAV_NA + 0] = th[1];
+        Phi[2 * NAV_NA + 1] = -th[0];
+        for (i = 0; i < 3; i++)
+            Phi[i * NAV_NA + i + 3] = -dt;
+        qa = (double)Cfg->GyroNoise_rads * Cfg->GyroNoise_rads * dt * dt;
+    }
+    else
+    {
+        qa = NAV_NO_GYRO_RATE_SIGMA * NAV_NO_GYRO_RATE_SIGMA * dt * dt;
+    }
+
+    CovPropagate(&A->P[0][0], Phi, NAV_NA);
+    for (i = 0; i < 3; i++)
+    {
+        A->P[i][i] += qa;
+        A->P[i + 3][i + 3] += qb;
+    }
+}
+
+/* One attitude fix (star tracker, or the LIDAR pose turned into a body attitude) */
+static bool AttUpdate(NAV_AttFilter_t *A, const NAV_CfgTbl_t *Cfg, const float q_meas[4], double sigma, double *mahal)
+{
+    float  q_e[4], q_c[4], rv[3];
+    double y[3], Rm[9], dx[NAV_NA];
+    int    i;
+
+    NAV_QuatConj(A->Q, q_c);
+    NAV_QuatMul(q_c, q_meas, q_e);
+    QuatToRotVec(q_e, rv);
+    for (i = 0; i < 3; i++)
+        y[i] = rv[i];
+    memset(Rm, 0, sizeof(Rm));
+    Rm[0] = Rm[4] = Rm[8] = sigma * sigma;
+    memset(dx, 0, sizeof(dx));
+
+    if (!KalmanUpdate3(NAV_NA, dx, &A->P[0][0], y, Rm, Cfg->GateSigma, mahal))
+        return false;
+
+    QuatApplyRotVec(A->Q, dx[0], dx[1], dx[2]);
+    for (i = 0; i < 3; i++)
+        A->Bias[i] += dx[i + 3];
+    return true;
+}
+
+/* ======================================================================= */
+/* Translation filter                                                       */
+/* ======================================================================= */
+
 /*
 ** Propagate over dt: Clohessy-Wiltshire, x' = A x, mapped to world axes as in
 ** ClohessyWiltshire.cs (+Y radial, -Z along-track, +X cross-track):
@@ -185,76 +446,73 @@ void NAV_Reset(NAV_State_t *S)
 **   a_y = 3n² r_y - 2n v_z     (radial; v_along = -v_z)
 **   a_z = 2n v_y               (-a_along)
 ** Φ = exp(A dt) by its series to third order (n·dt ~ 2e-4 per cycle, so the
-** truncation is far below float precision). The IMU's Δv over the cycle is
-** added as an impulse at mid-interval: it moves the position by Δv·dt/2.
+** truncation is far below float precision). The IMU's Δv over the cycle,
+** less the estimated bias, is added as an impulse at mid-interval: it moves
+** the position by Δv·dt/2. The bias state enters through that same path.
 **
 ** Process noise: unmodelled acceleration (σ_a) and accelerometer noise (σ_dv)
 ** both enter like that mid-interval impulse, per axis
 **   q = σ_a² dt² + σ_dv²,   Q = q [[dt²/4, dt/2], [dt/2, 1]]
+** and the bias random-walks.
 */
-static void FilterPropagate(NAV_Filter_t *F, const NAV_CfgTbl_t *Cfg, double dt, const double dv_L[3])
+static void FilterPropagate(NAV_Filter_t *F, const NAV_CfgTbl_t *Cfg, double dt, const float *q_L_B,
+                            const float *dv_B)
 {
     double n = Cfg->MeanMotion_rads;
-    double A[6][6], M2[6][6], M3[6][6], Phi[6][6], T[6][6], X[6];
+    double A[36], M2[36], M3[36], Phi[NAV_NX * NAV_NX], X[NAV_NX], dv_L[3] = {0.0, 0.0, 0.0};
     double q;
     int    i, j, k;
 
     memset(A, 0, sizeof(A));
     for (i = 0; i < 3; i++)
-        A[i][i + 3] = dt;
-    A[3][0] = -n * n * dt;
-    A[4][1] = 3.0 * n * n * dt;
-    A[4][5] = -2.0 * n * dt;
-    A[5][4] = 2.0 * n * dt;
+        A[i * 6 + i + 3] = dt;
+    A[3 * 6 + 0] = -n * n * dt;
+    A[4 * 6 + 1] = 3.0 * n * n * dt;
+    A[4 * 6 + 5] = -2.0 * n * dt;
+    A[5 * 6 + 4] = 2.0 * n * dt;
+    MatMul(A, A, M2, 6, 6, 6);
+    MatMul(M2, A, M3, 6, 6, 6);
 
+    memset(Phi, 0, sizeof(Phi));
     for (i = 0; i < 6; i++)
         for (j = 0; j < 6; j++)
-        {
-            M2[i][j] = 0.0;
-            for (k = 0; k < 6; k++)
-                M2[i][j] += A[i][k] * A[k][j];
-        }
-    for (i = 0; i < 6; i++)
-        for (j = 0; j < 6; j++)
-        {
-            M3[i][j] = 0.0;
-            for (k = 0; k < 6; k++)
-                M3[i][j] += M2[i][k] * A[k][j];
-        }
-    for (i = 0; i < 6; i++)
-        for (j = 0; j < 6; j++)
-            Phi[i][j] = (i == j ? 1.0 : 0.0) + A[i][j] + M2[i][j] / 2.0 + M3[i][j] / 6.0;
+            Phi[i * NAV_NX + j] = (i == j ? 1.0 : 0.0) + A[i * 6 + j] + M2[i * 6 + j] / 2.0 + M3[i * 6 + j] / 6.0;
+    for (i = 6; i < NAV_NX; i++)
+        Phi[i * NAV_NX + i] = 1.0;
 
-    /* State */
+    if (q_L_B != NULL && dv_B != NULL)
+    {
+        double R[9], dvc[3];
+        QuatToDcm(q_L_B, R);
+        for (i = 0; i < 3; i++)
+            dvc[i] = dv_B[i] - F->X[6 + i] * dt;
+        for (i = 0; i < 3; i++)
+        {
+            dv_L[i] = R[i * 3 + 0] * dvc[0] + R[i * 3 + 1] * dvc[1] + R[i * 3 + 2] * dvc[2];
+            for (j = 0; j < 3; j++)
+            {
+                Phi[i * NAV_NX + 6 + j]       = -R[i * 3 + j] * dt * dt / 2.0;
+                Phi[(i + 3) * NAV_NX + 6 + j] = -R[i * 3 + j] * dt;
+            }
+        }
+    }
+
+    /* State: the CW block with the measured impulse; the bias is constant */
     for (i = 0; i < 6; i++)
     {
         X[i] = 0.0;
         for (k = 0; k < 6; k++)
-            X[i] += Phi[i][k] * F->X[k];
+            X[i] += Phi[i * NAV_NX + k] * F->X[k];
     }
     for (i = 0; i < 3; i++)
     {
         X[i] += dv_L[i] * dt / 2.0;
         X[i + 3] += dv_L[i];
+        X[i + 6] = F->X[i + 6];
     }
     memcpy(F->X, X, sizeof(X));
 
-    /* Covariance: Φ P Φᵀ + Q */
-    for (i = 0; i < 6; i++)
-        for (j = 0; j < 6; j++)
-        {
-            T[i][j] = 0.0;
-            for (k = 0; k < 6; k++)
-                T[i][j] += Phi[i][k] * F->P[k][j];
-        }
-    for (i = 0; i < 6; i++)
-        for (j = 0; j < 6; j++)
-        {
-            F->P[i][j] = 0.0;
-            for (k = 0; k < 6; k++)
-                F->P[i][j] += T[i][k] * Phi[j][k];
-        }
-
+    CovPropagate(&F->P[0][0], Phi, NAV_NX);
     q = (double)Cfg->AccelNoise_mss * Cfg->AccelNoise_mss * dt * dt +
         (double)Cfg->DeltaVNoise_ms * Cfg->DeltaVNoise_ms;
     for (i = 0; i < 3; i++)
@@ -263,27 +521,8 @@ static void FilterPropagate(NAV_Filter_t *F, const NAV_CfgTbl_t *Cfg, double dt,
         F->P[i][i + 3] += q * dt / 2.0;
         F->P[i + 3][i] += q * dt / 2.0;
         F->P[i + 3][i + 3] += q;
+        F->P[i + 6][i + 6] += (double)Cfg->AccelBiasWalk_mss * Cfg->AccelBiasWalk_mss * dt;
     }
-}
-
-static bool Inverse3(double m[3][3], double inv[3][3])
-{
-    double det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) +
-                 m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
-
-    if (!(fabs(det) > 1e-300) || !isfinite(det))
-        return false;
-
-    inv[0][0] = (m[1][1] * m[2][2] - m[1][2] * m[2][1]) / det;
-    inv[0][1] = (m[0][2] * m[2][1] - m[0][1] * m[2][2]) / det;
-    inv[0][2] = (m[0][1] * m[1][2] - m[0][2] * m[1][1]) / det;
-    inv[1][0] = (m[1][2] * m[2][0] - m[1][0] * m[2][2]) / det;
-    inv[1][1] = (m[0][0] * m[2][2] - m[0][2] * m[2][0]) / det;
-    inv[1][2] = (m[0][2] * m[1][0] - m[0][0] * m[1][2]) / det;
-    inv[2][0] = (m[1][0] * m[2][1] - m[1][1] * m[2][0]) / det;
-    inv[2][1] = (m[0][1] * m[2][0] - m[0][0] * m[2][1]) / det;
-    inv[2][2] = (m[0][0] * m[1][1] - m[0][1] * m[1][0]) / det;
-    return true;
 }
 
 /*
@@ -296,16 +535,15 @@ static bool Inverse3(double m[3][3], double inv[3][3])
 ** Noise: range σ_r = RangeSigma + Frac·range and angle σ_a on az and el,
 ** mapped to position through the Jacobian of p_S(range, az, el) — so the
 ** range noise lies along the actual line of sight, which is well off the
-** boresight at close range or with the chaser rotated (an earlier version
-** put it along boresight and the gate then rejected good fixes inside 1 m).
-** Plus the star tracker error swinging the whole lever arm |p_B| (isotropic,
-** slightly conservative).
+** boresight at close range or with the chaser rotated. Plus the attitude
+** uncertainty swinging the whole lever arm |p_B| (isotropic, slightly
+** conservative).
 */
-static void RpsFix(const NAV_CfgTbl_t *Cfg, const float q_L_B[4], float range, float az, float el, double z[3],
-                   double Rm[3][3])
+static void RpsFix(const NAV_CfgTbl_t *Cfg, const float q_L_B[4], double attSigma, float range, float az, float el,
+                   double z[3], double Rm[9])
 {
     float  p_S[3], p_B[3], p_L[3], tp_L[3], q_L_S[4];
-    double M[3][3], J[3][3], G[3][3], D[3];
+    double M[9], J[9], G[9], D[3];
     double s_r = (double)Cfg->RpsRangeSigma_m + (double)Cfg->RpsRangeSigmaFrac * range;
     double s_a = Cfg->RpsAngleSigma_rad;
     double ce = cos(el), se = sin(el), ca = cos(az), sa = sin(az);
@@ -324,140 +562,51 @@ static void RpsFix(const NAV_CfgTbl_t *Cfg, const float q_L_B[4], float range, f
         z[i] = (double)tp_L[i] - p_L[i];
 
     /* Jacobian columns ∂p_S/∂range, ∂p_S/∂az, ∂p_S/∂el (sensor frame) */
-    J[0][0] = ce * sa;
-    J[1][0] = se;
-    J[2][0] = ce * ca;
-    J[0][1] = range * ce * ca;
-    J[1][1] = 0.0;
-    J[2][1] = -range * ce * sa;
-    J[0][2] = -range * se * sa;
-    J[1][2] = range * ce;
-    J[2][2] = -range * se * ca;
+    J[0] = ce * sa;
+    J[3] = se;
+    J[6] = ce * ca;
+    J[1] = range * ce * ca;
+    J[4] = 0.0;
+    J[7] = -range * ce * sa;
+    J[2] = -range * se * sa;
+    J[5] = range * ce;
+    J[8] = -range * se * ca;
 
-    /* G = M_L_S J; the fix z = tp_L - p_L, so its sign flips but the
-    ** covariance G D Gᵀ doesn't care */
     NAV_QuatMul(q_L_B, Cfg->RpsQuat_B, q_L_S);
     QuatToDcm(q_L_S, M);
-    for (i = 0; i < 3; i++)
-        for (j = 0; j < 3; j++)
-        {
-            G[i][j] = 0.0;
-            for (k = 0; k < 3; k++)
-                G[i][j] += M[i][k] * J[k][j];
-        }
+    MatMul(M, J, G, 3, 3, 3);
     D[0]  = s_r * s_r;
     D[1]  = s_a * s_a;
     D[2]  = s_a * s_a;
-    s_att = (double)Cfg->AttSigma_rad * Norm3(p_B);
+    s_att = attSigma * Norm3(p_B);
     for (i = 0; i < 3; i++)
         for (j = 0; j < 3; j++)
         {
-            Rm[i][j] = (i == j) ? s_att * s_att : 0.0;
+            Rm[i * 3 + j] = (i == j) ? s_att * s_att : 0.0;
             for (k = 0; k < 3; k++)
-                Rm[i][j] += G[i][k] * D[k] * G[j][k];
+                Rm[i * 3 + j] += G[i * 3 + k] * D[k] * G[j * 3 + k];
         }
 }
 
-static void FilterInit(NAV_Filter_t *F, const NAV_CfgTbl_t *Cfg, const double z[3], double Rm[3][3])
+static void FilterInit(NAV_Filter_t *F, const NAV_CfgTbl_t *Cfg, const double z[3], const double Rm[9])
 {
-    int i, j;
+    double b[3] = {0.0, 0.0, 0.0};
+    double sb   = Cfg->InitAccelBiasSigma_mss;
+    int    i, j;
 
+    if (F->Initialized) /* re-initialisation: the accelerometer is the same one */
+        memcpy(b, &F->X[6], sizeof(b));
     memset(F, 0, sizeof(*F));
     for (i = 0; i < 3; i++)
     {
-        F->X[i] = z[i];
+        F->X[i]     = z[i];
+        F->X[i + 6] = b[i];
         for (j = 0; j < 3; j++)
-            F->P[i][j] = Rm[i][j];
+            F->P[i][j] = Rm[i * 3 + j];
         F->P[i + 3][i + 3] = (double)Cfg->InitVelSigma_ms * Cfg->InitVelSigma_ms;
+        F->P[i + 6][i + 6] = sb * sb;
     }
     F->Initialized = true;
-}
-
-/* Kalman update with a direct position measurement (H = [I 0]), Joseph form.
-** Returns false (and leaves the filter alone) if the fix fails the gate. */
-static bool FilterUpdate(NAV_Filter_t *F, const double z[3], double Rm[3][3], double gate, double *mahal)
-{
-    double S[3][3], Si[3][3], K[6][3], y[3], d2 = 0.0;
-    double IKH[6][6], T[6][6], Pn[6][6];
-    int    i, j, k;
-
-    for (i = 0; i < 3; i++)
-    {
-        y[i] = z[i] - F->X[i];
-        for (j = 0; j < 3; j++)
-            S[i][j] = F->P[i][j] + Rm[i][j];
-    }
-    if (!Inverse3(S, Si))
-    {
-        *mahal = INFINITY;
-        return false;
-    }
-    for (i = 0; i < 3; i++)
-        for (j = 0; j < 3; j++)
-            d2 += y[i] * Si[i][j] * y[j];
-    *mahal = sqrt(d2 > 0.0 ? d2 : 0.0);
-    if (!(*mahal <= gate))
-        return false;
-
-    /* K = P Hᵀ S⁻¹ = P[:, 0:3] S⁻¹ */
-    for (i = 0; i < 6; i++)
-        for (j = 0; j < 3; j++)
-        {
-            K[i][j] = 0.0;
-            for (k = 0; k < 3; k++)
-                K[i][j] += F->P[i][k] * Si[k][j];
-        }
-    for (i = 0; i < 6; i++)
-        for (k = 0; k < 3; k++)
-            F->X[i] += K[i][k] * y[k];
-
-    /* P = (I - KH) P (I - KH)ᵀ + K R Kᵀ */
-    for (i = 0; i < 6; i++)
-        for (j = 0; j < 6; j++)
-            IKH[i][j] = (i == j ? 1.0 : 0.0) - (j < 3 ? K[i][j] : 0.0);
-    for (i = 0; i < 6; i++)
-        for (j = 0; j < 6; j++)
-        {
-            T[i][j] = 0.0;
-            for (k = 0; k < 6; k++)
-                T[i][j] += IKH[i][k] * F->P[k][j];
-        }
-    for (i = 0; i < 6; i++)
-        for (j = 0; j < 6; j++)
-        {
-            Pn[i][j] = 0.0;
-            for (k = 0; k < 6; k++)
-                Pn[i][j] += T[i][k] * IKH[j][k];
-        }
-    for (i = 0; i < 6; i++)
-        for (j = 0; j < 6; j++)
-        {
-            double krk = 0.0;
-            int    a, b;
-            for (a = 0; a < 3; a++)
-                for (b = 0; b < 3; b++)
-                    krk += K[i][a] * Rm[a][b] * K[j][b];
-            Pn[i][j] += krk;
-        }
-    /* symmetrise against round-off */
-    for (i = 0; i < 6; i++)
-        for (j = 0; j < 6; j++)
-            F->P[i][j] = 0.5 * (Pn[i][j] + Pn[j][i]);
-    return true;
-}
-
-static bool FilterFinite(const NAV_Filter_t *F)
-{
-    int i, j;
-    for (i = 0; i < 6; i++)
-    {
-        if (!isfinite(F->X[i]))
-            return false;
-        for (j = 0; j < 6; j++)
-            if (!isfinite(F->P[i][j]))
-                return false;
-    }
-    return true;
 }
 
 /* ======================================================================= */
@@ -466,22 +615,28 @@ static bool FilterFinite(const NAV_Filter_t *F)
 
 void NAV_Step(NAV_State_t *S, const NAV_CfgTbl_t *Cfg, const SIMLINK_SimState_t *In, NAV_Output_t *Out)
 {
-    float  dt   = In->CycleDt_s;
-    bool   imu  = false;
-    bool   att  = false;
-    float  rate[3] = {0.0f, 0.0f, 0.0f};
-    float  dv_B[3] = {0.0f, 0.0f, 0.0f};
-    int    i;
+    NAV_AttFilter_t *A    = &S->Att;
+    NAV_Filter_t    *F    = &S->Filter;
+    float            dt   = In->CycleDt_s;
+    bool             imu  = false;
+    bool             st   = false;
+    bool             pose = false;
+    bool             att  = false;
+    float            gyro[3] = {0.0f, 0.0f, 0.0f};
+    float            dv_B[3] = {0.0f, 0.0f, 0.0f};
+    float            q_st[4], q_pose[4];
+    double           attSigma = 0.0;
+    int              i;
 
     memset(Out, 0, sizeof(*Out));
 
-    /* --- 1. IMU --------------------------------------------------------- */
+    /* --- 1. Sensor sanity ----------------------------------------------- */
     if (In->SensorValid & SIMLINK_SENSOR_IMU)
     {
         if (Finite(In->GyroRate_B, 3) && Finite(In->DeltaV_B, 3))
         {
             imu = true;
-            memcpy(rate, In->GyroRate_B, sizeof(rate));
+            memcpy(gyro, In->GyroRate_B, sizeof(gyro));
             memcpy(dv_B, In->DeltaV_B, sizeof(dv_B));
             Out->Status |= NAV_STATUS_RATE_VALID | NAV_STATUS_DV_VALID;
         }
@@ -490,63 +645,109 @@ void NAV_Step(NAV_State_t *S, const NAV_CfgTbl_t *Cfg, const SIMLINK_SimState_t 
             Out->Events |= NAV_EVT_SENSOR_REJECT;
         }
     }
-
-    /* --- 2. Attitude: star tracker, else gyro propagation ---------------- */
     if (In->SensorValid & SIMLINK_SENSOR_ST)
     {
-        float q[4];
-        memcpy(q, In->StQuat, sizeof(q));
-        if (NAV_QuatNormalize(q, 0.01f))
+        memcpy(q_st, In->StQuat, sizeof(q_st));
+        st = NAV_QuatNormalize(q_st, 0.01f);
+        if (!st)
+            Out->Events |= NAV_EVT_SENSOR_REJECT;
+    }
+    if (In->SensorValid & SIMLINK_SENSOR_RPS_POSE)
+    {
+        float q_S_TP[4];
+        memcpy(q_S_TP, In->RpsQuat, sizeof(q_S_TP));
+        if (NAV_QuatNormalize(q_S_TP, 0.01f))
         {
-            memcpy(S->Att, q, sizeof(q));
-            S->HaveAtt       = true;
-            S->AttPropCycles = 0;
-            att              = true;
-            Out->Status |= NAV_STATUS_ST_USED;
+            /* body attitude implied by the pose: q_L_B = q_L_TP ⊗ q_TP_S ⊗ q_S_B */
+            float q_L_TP[4], q_tmp[4], q_L_S[4];
+            NAV_QuatMul(Cfg->TargetAttQuat_L, Cfg->TargetPortQuat_T, q_L_TP);
+            NAV_QuatConj(q_S_TP, q_tmp);
+            NAV_QuatMul(q_L_TP, q_tmp, q_L_S);
+            NAV_QuatConj(Cfg->RpsQuat_B, q_tmp);
+            NAV_QuatMul(q_L_S, q_tmp, q_pose);
+            pose = true;
         }
         else
         {
             Out->Events |= NAV_EVT_SENSOR_REJECT;
         }
     }
-    if (!att && S->HaveAtt && imu && S->AttPropCycles < NAV_MAX_ATT_PROP_CYCLES)
+
+    /* --- 2. Attitude filter --------------------------------------------- */
+    if (A->Initialized)
+        AttPropagate(A, Cfg, dt, imu, gyro);
+
+    if (st)
     {
-        /* q ← q ⊗ δq(ω dt), body-frame rate */
-        float th = Norm3(rate) * dt;
-        float dq[4];
-        if (th > 1e-12f)
+        double mahal = 0.0;
+        if (!A->Initialized)
         {
-            float s = sinf(0.5f * th) / Norm3(rate);
-            dq[0]   = rate[0] * s;
-            dq[1]   = rate[1] * s;
-            dq[2]   = rate[2] * s;
-            dq[3]   = cosf(0.5f * th);
-            NAV_QuatMul(S->Att, dq, S->Att);
-            (void)NAV_QuatNormalize(S->Att, 0.5f);
+            AttInit(A, Cfg, q_st, Cfg->AttSigma_rad, false);
+            Out->Events |= NAV_EVT_ATT_INIT;
+            Out->Status |= NAV_STATUS_ST_USED;
         }
-        S->AttPropCycles++;
-        att = true;
+        else if (AttUpdate(A, Cfg, q_st, Cfg->AttSigma_rad, &mahal))
+        {
+            A->ConsecRejects = 0;
+            Out->Status |= NAV_STATUS_ST_USED;
+        }
+        else
+        {
+            Out->Status |= NAV_STATUS_ATT_REJECTED;
+            if (++A->ConsecRejects >= Cfg->MaxConsecRejects)
+            {
+                AttInit(A, Cfg, q_st, Cfg->AttSigma_rad, true);
+                Out->Events |= NAV_EVT_ATT_REINIT;
+                Out->Status |= NAV_STATUS_ST_USED;
+            }
+        }
+        if (mahal > Out->AttInnovSigma)
+            Out->AttInnovSigma = isfinite(mahal) ? (float)mahal : 1e30f;
     }
-    else if (!att)
+    if (pose)
     {
-        S->HaveAtt = S->HaveAtt && S->AttPropCycles < NAV_MAX_ATT_PROP_CYCLES;
+        double mahal = 0.0;
+        if (!A->Initialized)
+        {
+            AttInit(A, Cfg, q_pose, Cfg->RpsPoseSigma_rad, false);
+            Out->Events |= NAV_EVT_ATT_INIT;
+            Out->Status |= NAV_STATUS_POSE_USED;
+        }
+        else if (AttUpdate(A, Cfg, q_pose, Cfg->RpsPoseSigma_rad, &mahal))
+        {
+            Out->Status |= NAV_STATUS_POSE_USED;
+        }
+        else
+        {
+            Out->Status |= NAV_STATUS_ATT_REJECTED;
+        }
+        if (mahal > Out->AttInnovSigma)
+            Out->AttInnovSigma = isfinite(mahal) ? (float)mahal : 1e30f;
+    }
+
+    if (imu)
+        memcpy(A->PrevGyro, gyro, sizeof(gyro));
+    A->HavePrevGyro = imu;
+
+    if (A->Initialized && (!Finite(A->Q, 4) || !AllFinite(A->Bias, 3) || !AllFinite(&A->P[0][0], NAV_NA * NAV_NA)))
+    {
+        memset(A, 0, sizeof(*A));
+        Out->Events |= NAV_EVT_ATT_REINIT;
+    }
+    if (A->Initialized)
+    {
+        attSigma = MaxDiagSigma(&A->P[0][0], NAV_NA, 0, 3);
+        att      = attSigma <= Cfg->MaxAttSigma_rad;
+        Out->AttSigma_rad = (float)attSigma;
+        for (i = 0; i < 3; i++)
+            Out->GyroBias_rads[i] = (float)A->Bias[i];
     }
     if (att)
         Out->Status |= NAV_STATUS_ATT_VALID;
 
-    /* --- 3. Translation filter: propagate ------------------------------- */
-    if (S->Filter.Initialized)
-    {
-        double dv_L[3] = {0.0, 0.0, 0.0};
-        if (imu && att)
-        {
-            float v[3];
-            NAV_QuatRotate(S->Att, dv_B, v);
-            for (i = 0; i < 3; i++)
-                dv_L[i] = v[i];
-        }
-        FilterPropagate(&S->Filter, Cfg, dt, dv_L);
-    }
+    /* --- 3. Translation filter: propagate -------------------------------- */
+    if (F->Initialized)
+        FilterPropagate(F, Cfg, dt, att ? A->Q : NULL, imu ? dv_B : NULL);
 
     /* --- 4. LIDAR update ------------------------------------------------- */
     if (In->SensorValid & SIMLINK_SENSOR_RPS)
@@ -559,53 +760,64 @@ void NAV_Step(NAV_State_t *S, const NAV_CfgTbl_t *Cfg, const SIMLINK_SimState_t 
         }
         else if (att) /* the fix needs attitude to become an LVLH position */
         {
-            double z[3], Rm[3][3], mahal = 0.0;
+            double z[3], Rm[9], y[3], mahal = 0.0;
 
             Out->RpsAvailable = true;
-            RpsFix(Cfg, S->Att, In->RpsRange_m, In->RpsAz_rad, In->RpsEl_rad, z, Rm);
+            RpsFix(Cfg, A->Q, attSigma, In->RpsRange_m, In->RpsAz_rad, In->RpsEl_rad, z, Rm);
 
-            if (!S->Filter.Initialized)
+            if (!F->Initialized)
             {
-                FilterInit(&S->Filter, Cfg, z, Rm);
+                FilterInit(F, Cfg, z, Rm);
                 Out->Events |= NAV_EVT_FILTER_INIT;
-                Out->Status |= NAV_STATUS_RPS_USED;
-            }
-            else if (FilterUpdate(&S->Filter, z, Rm, Cfg->GateSigma, &mahal))
-            {
-                S->Filter.ConsecRejects = 0;
                 Out->Status |= NAV_STATUS_RPS_USED;
             }
             else
             {
-                Out->Status |= NAV_STATUS_RPS_REJECTED;
-                if (++S->Filter.ConsecRejects >= Cfg->MaxConsecRejects)
+                for (i = 0; i < 3; i++)
+                    y[i] = z[i] - F->X[i];
+                if (KalmanUpdate3(NAV_NX, F->X, &F->P[0][0], y, Rm, Cfg->GateSigma, &mahal))
                 {
-                    /* The filter and the sensor disagree persistently: trust the
-                    ** sensor (scenario reset, missed thrust, a bad propagation). */
-                    FilterInit(&S->Filter, Cfg, z, Rm);
-                    Out->Events |= NAV_EVT_FILTER_REINIT;
+                    F->ConsecRejects = 0;
                     Out->Status |= NAV_STATUS_RPS_USED;
+                }
+                else
+                {
+                    Out->Status |= NAV_STATUS_RPS_REJECTED;
+                    if (++F->ConsecRejects >= Cfg->MaxConsecRejects)
+                    {
+                        /* The filter and the sensor disagree persistently: trust the
+                        ** sensor (scenario reset, missed thrust, a bad propagation). */
+                        FilterInit(F, Cfg, z, Rm);
+                        Out->Events |= NAV_EVT_FILTER_REINIT;
+                        Out->Status |= NAV_STATUS_RPS_USED;
+                    }
                 }
             }
             Out->InnovSigma = isfinite(mahal) ? (float)mahal : 1e30f;
         }
     }
 
-    if (S->Filter.Initialized && !FilterFinite(&S->Filter))
+    if (F->Initialized && (!AllFinite(F->X, NAV_NX) || !AllFinite(&F->P[0][0], NAV_NX * NAV_NX)))
     {
         NAV_ResetFilter(S);
         Out->Events |= NAV_EVT_FILTER_REINIT;
     }
 
     /* --- 5. Outputs ------------------------------------------------------ */
-    memcpy(Out->AngRate_B, rate, sizeof(rate));
-    memcpy(Out->DeltaV_B, dv_B, sizeof(dv_B));
+    Out->ConsecRpsRejects = F->ConsecRejects;
+    for (i = 0; i < 3; i++)
+    {
+        Out->AngRate_B[i] = imu ? (float)(gyro[i] - (A->Initialized ? A->Bias[i] : 0.0)) : 0.0f;
+        Out->DeltaV_B[i]  = imu ? (float)(dv_B[i] - (F->Initialized ? F->X[6 + i] * dt : 0.0)) : 0.0f;
+        if (F->Initialized)
+            Out->AccelBias_mss[i] = (float)F->X[6 + i];
+    }
 
     if (att)
     {
         float q_L_D[4], q_L_Bdes[4], q_tmp[4], q_e[4];
 
-        memcpy(Out->AttQuat_L, S->Att, sizeof(S->Att));
+        memcpy(Out->AttQuat_L, A->Q, sizeof(A->Q));
 
         /* Docking frame and docking attitude from the table geometry */
         NAV_QuatMul(Cfg->TargetAttQuat_L, Cfg->TargetPortQuat_T, q_tmp);
@@ -614,19 +826,17 @@ void NAV_Step(NAV_State_t *S, const NAV_CfgTbl_t *Cfg, const SIMLINK_SimState_t 
         NAV_QuatMul(q_L_D, q_tmp, q_L_Bdes);
 
         /* Attitude error: q_e = conj(q_L_B) ⊗ q_L_Bdes, as a body-axis rotation vector */
-        NAV_QuatConj(S->Att, q_tmp);
+        NAV_QuatConj(A->Q, q_tmp);
         NAV_QuatMul(q_tmp, q_L_Bdes, q_e);
         QuatToRotVec(q_e, Out->AttErr_B);
 
-        if (S->Filter.Initialized)
+        if (F->Initialized)
         {
-            const NAV_Filter_t *F = &S->Filter;
             float r_port_L[3], wxr_B[3], wxr_L[3], tp_L[3], pos_L[3], vel_L[3], q_D_L[4];
-            double ps = 0.0, vs = 0.0;
 
-            NAV_QuatRotate(S->Att, Cfg->ChaserPortPos_B, r_port_L);
-            Cross(rate, Cfg->ChaserPortPos_B, wxr_B);
-            NAV_QuatRotate(S->Att, wxr_B, wxr_L);
+            NAV_QuatRotate(A->Q, Cfg->ChaserPortPos_B, r_port_L);
+            Cross(Out->AngRate_B, Cfg->ChaserPortPos_B, wxr_B);
+            NAV_QuatRotate(A->Q, wxr_B, wxr_L);
             NAV_QuatRotate(Cfg->TargetAttQuat_L, Cfg->TargetPortPos_T, tp_L);
 
             for (i = 0; i < 3; i++)
@@ -635,10 +845,6 @@ void NAV_Step(NAV_State_t *S, const NAV_CfgTbl_t *Cfg, const SIMLINK_SimState_t 
                 Out->CmVel_L[i] = (float)F->X[i + 3];
                 pos_L[i]        = (float)F->X[i] + r_port_L[i] - tp_L[i];
                 vel_L[i]        = (float)F->X[i + 3] + wxr_L[i];
-                if (F->P[i][i] > ps)
-                    ps = F->P[i][i];
-                if (F->P[i + 3][i + 3] > vs)
-                    vs = F->P[i + 3][i + 3];
             }
             NAV_QuatConj(q_L_D, q_D_L);
             NAV_QuatRotate(q_D_L, pos_L, Out->PortPos_D);
@@ -647,15 +853,15 @@ void NAV_Step(NAV_State_t *S, const NAV_CfgTbl_t *Cfg, const SIMLINK_SimState_t 
             Out->Range_m         = Norm3(Out->PortPos_D);
             Out->ClosingSpeed_ms = Out->PortVel_D[2];
             Out->LateralOffset_m = sqrtf(Out->PortPos_D[0] * Out->PortPos_D[0] + Out->PortPos_D[1] * Out->PortPos_D[1]);
-            Out->PosSigma_m      = (float)sqrt(ps);
-            Out->VelSigma_ms     = (float)sqrt(vs);
+            Out->PosSigma_m      = (float)MaxDiagSigma(&F->P[0][0], NAV_NX, 0, 3);
+            Out->VelSigma_ms     = (float)MaxDiagSigma(&F->P[0][0], NAV_NX, 3, 3);
 
             Out->Status |= NAV_STATUS_FILTER_INIT;
             if (imu && Out->PosSigma_m <= Cfg->MaxPosSigma_m && Out->VelSigma_ms <= Cfg->MaxVelSigma_ms)
                 Out->Status |= NAV_STATUS_RELNAV_VALID;
         }
     }
-    else if (S->Filter.Initialized)
+    else if (F->Initialized)
     {
         Out->Status |= NAV_STATUS_FILTER_INIT;
     }

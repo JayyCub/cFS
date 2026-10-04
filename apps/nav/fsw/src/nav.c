@@ -43,6 +43,16 @@ static void NAV_ReportTransitions(const NAV_Output_t *Out, uint32 Seq)
                           "NAV: filter disagreed with LIDAR (innovation %.1f sigma) — re-initialised (Seq %lu)",
                           (double)Out->InnovSigma, (unsigned long)Seq);
 
+    if (Out->Events & NAV_EVT_ATT_INIT)
+        CFE_EVS_SendEvent(NAV_ATT_FILTER_INF_EID, CFE_EVS_EventType_INFORMATION,
+                          "NAV: attitude filter initialised from the %s (Seq %lu)",
+                          (Out->Status & NAV_STATUS_ST_USED) ? "star tracker" : "LIDAR pose", (unsigned long)Seq);
+
+    if (Out->Events & NAV_EVT_ATT_REINIT)
+        CFE_EVS_SendEvent(NAV_ATT_FILTER_ERR_EID, CFE_EVS_EventType_ERROR,
+                          "NAV: attitude filter disagreed with the star tracker (%.1f sigma) — re-initialised (Seq %lu)",
+                          (double)Out->AttInnovSigma, (unsigned long)Seq);
+
     if (Out->Events & NAV_EVT_SENSOR_REJECT)
     {
         if (!NAV_Data.SensorRejectLatched)
@@ -119,6 +129,8 @@ static void NAV_ProcessSimState(const SIM_IO_SimStateMsg_t *Msg)
             NAV_Data.HkTlm.FilterInits++;
         if (Out.Events & NAV_EVT_SENSOR_REJECT)
             NAV_Data.HkTlm.SensorRejects++;
+        if (Out.Status & NAV_STATUS_ATT_REJECTED)
+            NAV_Data.HkTlm.AttRejected++;
         if (Out.RpsAvailable)
             NAV_Data.HkTlm.LastInnovSigma = Out.InnovSigma;
     }
@@ -129,6 +141,7 @@ static void NAV_ProcessSimState(const SIM_IO_SimStateMsg_t *Msg)
     Sol->Seq       = Msg->Seq;
     Sol->CycleDt_s = dt;
     Sol->Status    = Out.Status;
+    Sol->ConsecRpsRejects = (Out.ConsecRpsRejects > 0xFFFF) ? 0xFFFF : (uint16)Out.ConsecRpsRejects;
     memcpy(Sol->AttQuat_L, Out.AttQuat_L, sizeof(Sol->AttQuat_L));
     memcpy(Sol->AngRate_B, Out.AngRate_B, sizeof(Sol->AngRate_B));
     memcpy(Sol->AttErr_B, Out.AttErr_B, sizeof(Sol->AttErr_B));
@@ -140,12 +153,16 @@ static void NAV_ProcessSimState(const SIM_IO_SimStateMsg_t *Msg)
     Sol->ClosingSpeed_ms = Out.ClosingSpeed_ms;
     Sol->LateralOffset_m = Out.LateralOffset_m;
     memcpy(Sol->DeltaV_B, Out.DeltaV_B, sizeof(Sol->DeltaV_B));
-    Sol->PosSigma_m  = Out.PosSigma_m;
-    Sol->VelSigma_ms = Out.VelSigma_ms;
+    Sol->PosSigma_m   = Out.PosSigma_m;
+    Sol->VelSigma_ms  = Out.VelSigma_ms;
+    Sol->AttSigma_rad = Out.AttSigma_rad;
 
-    NAV_Data.HkTlm.Status      = Out.Status;
-    NAV_Data.HkTlm.PosSigma_m  = Out.PosSigma_m;
-    NAV_Data.HkTlm.VelSigma_ms = Out.VelSigma_ms;
+    NAV_Data.HkTlm.Status       = Out.Status;
+    NAV_Data.HkTlm.PosSigma_m   = Out.PosSigma_m;
+    NAV_Data.HkTlm.VelSigma_ms  = Out.VelSigma_ms;
+    NAV_Data.HkTlm.AttSigma_rad = Out.AttSigma_rad;
+    memcpy(NAV_Data.HkTlm.GyroBias_rads, Out.GyroBias_rads, sizeof(NAV_Data.HkTlm.GyroBias_rads));
+    memcpy(NAV_Data.HkTlm.AccelBias_mss, Out.AccelBias_mss, sizeof(NAV_Data.HkTlm.AccelBias_mss));
 
     CFE_SB_TimeStampMsg(CFE_MSG_PTR(Sol->TelemetryHeader));
     CFE_SB_TransmitMsg(CFE_MSG_PTR(Sol->TelemetryHeader), true);
@@ -181,6 +198,7 @@ static void NAV_ProcessGroundCmd(const CFE_SB_Buffer_t *BufPtr)
             NAV_Data.HkTlm.RpsUnavailable = 0;
             NAV_Data.HkTlm.FilterInits    = 0;
             NAV_Data.HkTlm.SensorRejects  = 0;
+            NAV_Data.HkTlm.AttRejected    = 0;
             CFE_EVS_SendEvent(NAV_RESET_INF_EID, CFE_EVS_EventType_INFORMATION, "NAV: counters reset");
             break;
 
@@ -256,7 +274,7 @@ CFE_Status_t NAV_Init(void)
     }
 
     CFE_EVS_SendEvent(NAV_INIT_INF_EID, CFE_EVS_EventType_INFORMATION,
-                      "NAV initialized: IMU + star tracker + LIDAR, CW Kalman filter, table %s", NAV_CFG_TBL_FILE);
+                      "NAV initialized: attitude MEKF + CW Kalman filter (IMU, star tracker, LIDAR), table %s", NAV_CFG_TBL_FILE);
     return CFE_SUCCESS;
 }
 

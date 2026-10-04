@@ -43,9 +43,10 @@ typedef struct
     uint32                    Seq;       /* SIM_STATE Seq                                    */
     float                     CycleDt_s; /* sim time since the previous cycle                 */
     uint32                    Status;    /* NAV_STATUS_*                                      */
-    uint32                    Spare;
-    float                     AttQuat_L[4];    /* q_L_B (x, y, z, w)                          */
-    float                     AngRate_B[3];    /* body rate (rad/s)                           */
+    uint16                    ConsecRpsRejects; /* LIDAR fixes rejected in a row (LC watches it) */
+    uint16                    Spare;
+    float                     AttQuat_L[4];    /* q_L_B (x, y, z, w), attitude filter estimate */
+    float                     AngRate_B[3];    /* body rate, gyro minus estimated bias (rad/s) */
     float                     AttErr_B[3];     /* rotation vector, body axes, that takes the
                                                ** body to the docking attitude (rad)          */
     float                     CmPos_L[3];      /* chaser CoM - target reference point (m)      */
@@ -57,9 +58,11 @@ typedef struct
     float                     ClosingSpeed_ms; /* PortVel_D[2]; + = closing                    */
     float                     LateralOffset_m; /* |PortPos_D[0..1]|                            */
     float                     DeltaV_B[3];     /* IMU non-gravitational Δv over the cycle that
-                                               ** just ended (m/s)                             */
+                                               ** just ended, estimated bias removed (m/s)     */
     float                     PosSigma_m;      /* largest position 1-sigma (m)                 */
     float                     VelSigma_ms;     /* largest velocity 1-sigma (m/s)               */
+    float                     AttSigma_rad;    /* largest attitude 1-sigma (rad)               */
+    float                     Spare2;
 } NAV_SolutionMsg_t;
 
 /* Housekeeping (NAV_HK_TLM_MID), 1 Hz */
@@ -78,10 +81,14 @@ typedef struct
     float                     LastInnovSigma; /* Mahalanobis distance of the last LIDAR fix        */
     float                     PosSigma_m;
     float                     VelSigma_ms;
+    float                     AttSigma_rad;
+    float                     GyroBias_rads[3];  /* attitude filter's gyro bias estimate          */
+    float                     AccelBias_mss[3];  /* translation filter's accelerometer bias est.  */
+    uint32                    AttRejected;       /* attitude fixes that failed the gate           */
 } NAV_HkTlm_t;
 
-_Static_assert(sizeof(NAV_SolutionMsg_t) == 160, "NAV SOLUTION layout changed - update ground tools");
+_Static_assert(sizeof(NAV_SolutionMsg_t) == 168, "NAV SOLUTION layout changed - update LC WDT and ground tools");
 _Static_assert(offsetof(NAV_SolutionMsg_t, SimTime_s) == 16, "NAV SOLUTION layout changed - update ground tools");
-_Static_assert(sizeof(NAV_HkTlm_t) == 64, "NAV HK layout changed - update ground tools");
+_Static_assert(sizeof(NAV_HkTlm_t) == 96, "NAV HK layout changed - update ground tools");
 
 #endif /* NAV_MSG_H */

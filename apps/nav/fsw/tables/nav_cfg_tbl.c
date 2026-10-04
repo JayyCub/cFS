@@ -35,15 +35,25 @@ NAV_CfgTbl_t NAV_CfgTbl = {
     .RpsRangeSigmaFrac = 0.001f,  /* ... + 0.1 % of range          */
     .RpsAngleSigma_rad = 0.0005f, /* 0.03 deg az / el              */
     .AttSigma_rad      = 0.00005f, /* ~10 arcsec star tracker       */
+    .RpsPoseSigma_rad  = 0.004f,  /* LIDAR pose, ~0.23 deg         */
 
     /* Filter tuning */
-    .AccelNoise_mss   = 0.00005f, /* unmodelled acceleration                               */
+    .AccelNoise_mss   = 0.00002f, /* unmodelled acceleration (accel bias is now a state)   */
     .DeltaVNoise_ms   = 0.00002f, /* accelerometer Δv noise per cycle                      */
     .InitVelSigma_ms  = 0.1f,
     .GateSigma        = 6.0f,     /* 3-DOF chi-square: a 6-sigma fix is ~1e-7 likely       */
     .MaxConsecRejects = 10,       /* 2 s of disagreement at 5 Hz -> re-initialise          */
     .MaxPosSigma_m    = 0.5f,
     .MaxVelSigma_ms   = 0.005f,   /* half GNC's LatEntryVelMax_ms                          */
+
+    /* Sensor errors estimated by the filters (phase 4b) */
+    .AccelBiasWalk_mss      = 1e-7f,   /* m/s² per sqrt(s)                                  */
+    .InitAccelBiasSigma_mss = 1e-4f,   /* ~10 micro-g                                       */
+    .GyroNoise_rads         = 2e-5f,   /* 2x the hardware spec: also covers the trapezoidal
+                                          integration error during thruster pulses           */
+    .GyroBiasWalk_rads      = 1e-8f,   /* rad/s per sqrt(s)                                 */
+    .InitGyroBiasSigma_rads = 1e-5f,   /* ~2 deg/h                                          */
+    .MaxAttSigma_rad        = 0.005f,  /* 0.3 deg: attitude VALID limit                     */
 };
 
 CFE_TBL_FILEDEF(NAV_CfgTbl, NAV.CfgTbl, NAV configuration, nav_cfg_tbl.tbl)
